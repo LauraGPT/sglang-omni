@@ -16,6 +16,7 @@ from sglang_omni.models.dots_tts.codec import (
     DotsReferenceEncoder,
     load_dots_audio_codec,
 )
+from sglang_omni.models.dots_tts.compat import import_dots_tts
 from sglang_omni.models.dots_tts.payload_types import DotsTTSState
 from sglang_omni.models.dots_tts.vocoder import DotsTTSStreamingVocoder
 from sglang_omni.proto import StagePayload
@@ -39,6 +40,7 @@ def _configure_optimized_kernels() -> None:
     This temporary upstream monkey patch is restored once dots.tts supports
     shared-module FX for its one-shot prefill and recurrent decode modules.
     """
+    import_dots_tts()
     from dots_tts.modules.backbone import dit_inference, inference_utils
     from sglang.srt.compilation.torch_compile_decoration import set_torch_compile_config
 
@@ -98,8 +100,9 @@ def preprocess_dots_tts_payload(
     model_config: Any,
     max_generate_length: int,
     max_sequence_length: int,
-    default_num_steps: int = 4,
+    num_steps: int = 4,
 ) -> StagePayload:
+    import_dots_tts()
     from dots_tts.data.pipelines.tokenizing import build_generation_schedule
     from dots_tts.data.pipelines.tts_pipeline import (
         DEFAULT_INSTRUCTION_TTS_TEMPLATE,
@@ -265,7 +268,7 @@ def preprocess_dots_tts_payload(
                 tts_params.get("num_steps"),
                 engine_params.get("num_steps"),
                 params.get("num_steps"),
-                default=default_num_steps,
+                default=num_steps,
             )
         ),
         guidance_scale=float(
@@ -325,6 +328,7 @@ def preprocess_dots_tts_payload(
 
 
 def _load_model_metadata(model_path: str) -> tuple[str, Any, Any, int]:
+    import_dots_tts()
     from dots_tts.models.dots_tts.config import ModelConfig
     from transformers import AutoTokenizer
 
@@ -345,7 +349,7 @@ def create_preprocessing_executor(
     model_path: str,
     *,
     max_generate_length: int = 500,
-    default_num_steps: int = 4,
+    num_steps: int = 4,
     max_concurrency: int = 8,
 ) -> SimpleScheduler:
     _root, config, tokenizer, context_length = _load_model_metadata(model_path)
@@ -357,7 +361,7 @@ def create_preprocessing_executor(
             model_config=config,
             max_generate_length=max_generate_length,
             max_sequence_length=context_length,
-            default_num_steps=default_num_steps,
+            num_steps=num_steps,
         )
 
     return SimpleScheduler(_preprocess, max_concurrency=max_concurrency)
@@ -422,7 +426,7 @@ def create_vocoder_executor(
     vocoder_merge_steps: int = 4,
     max_batch_size: int = 4,
     max_batch_wait_ms: int = 2,
-    **_: Any,
+    stream_slots: int = 16,
 ) -> DotsTTSStreamingVocoder:
     codec = load_dots_audio_codec(model_path, device=_device(device, gpu_id))
     vocoder = DotsTTSStreamingVocoder(
@@ -431,12 +435,20 @@ def create_vocoder_executor(
         merge_steps=vocoder_merge_steps,
         max_batch_size=max_batch_size,
         max_batch_wait_ms=max_batch_wait_ms,
+        stream_slots=stream_slots,
     )
+    # note (guozhihao-224): allocate the slot pool at setup so OOM / shape
+    # mismatch surface before readiness, not on the first live chunk.
+    vocoder.ensure_slot_pool()
     logging.getLogger(__name__).info(
-        "dots.tts vocoder backend: %s (merge_steps=%d, batch_size=%d, wait_ms=%d)",
-        "compiled streaming chunks" if vocoder.optimize else "eager per-patch decode",
+        "dots.tts vocoder backend: slot-pooled eager streaming "
+        "(optimize=%s, merge_steps=%d, stream_slots=%d, batch_size=%d, "
+        "stream_batch_cap=%d, wait_ms=%d)",
+        optimize,
         vocoder.merge_steps,
+        vocoder.stream_slots,
         max_batch_size,
+        vocoder._stream_chunk_batch_max,
         max_batch_wait_ms,
     )
     return vocoder

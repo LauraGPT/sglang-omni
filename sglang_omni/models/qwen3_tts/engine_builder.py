@@ -6,16 +6,28 @@ from __future__ import annotations
 import importlib
 from typing import Any
 
-from sglang_omni.models.qwen3_tts import request_builders
+from sglang_omni.models.qwen3_tts import CAPABILITIES, request_builders
 from sglang_omni.models.qwen3_tts import stages as qwen3_stages
 from sglang_omni.scheduling.engine_factory import TtsEngineBuilder
-from sglang_omni.vendor.sglang.server_args import override_server_args
+
+
+def _is_truthy(value: Any) -> bool:
+    if isinstance(value, bool):
+        return value
+    if isinstance(value, int):
+        return value != 0
+    if isinstance(value, str):
+        return value.strip().lower() in {"1", "true", "yes", "y", "on"}
+    return False
 
 
 class Qwen3TtsEngineBuilder(TtsEngineBuilder):
     model_name = "Qwen3-TTS"
     context_length = 8192
     model_arch_override = "Qwen3TTSTalker"
+    supports_breakable_prefill_cuda_graph = (
+        CAPABILITIES.supports_breakable_prefill_cuda_graph
+    )
 
     def __init__(self, *, attn_implementation: str | None = None) -> None:
         self.attn_implementation = attn_implementation
@@ -42,12 +54,13 @@ class Qwen3TtsEngineBuilder(TtsEngineBuilder):
     ) -> dict[str, Any]:
         return {
             "max_running_requests": 16,
+            "max_queued_requests": 16,
             "cuda_graph_max_bs": 32,
             "torch_compile_max_bs": 32,
             "dtype": dtype,
             "disable_cuda_graph": False,
             "disable_overlap_schedule": True,
-            "enable_torch_compile": True,
+            "enable_torch_compile": False,
             "mem_fraction_static": 0.85,
             "max_prefill_tokens": 8192,
             "sampling_backend": "pytorch",
@@ -91,14 +104,9 @@ class Qwen3TtsEngineBuilder(TtsEngineBuilder):
             wrapper=self.wrapper,
         )
 
-    def compile_model(self, model: Any, server_args: Any) -> None:
-        if bool(server_args.enable_torch_compile):
-            qwen3_stages._compile_qwen3_tts_backbone(model)
-            override_server_args(
-                server_args,
-                "sglang_omni.qwen3_tts.compile_complete",
-                enable_torch_compile=False,
-            )
+    def adjust_overrides(self, overrides: dict[str, Any]) -> None:
+        if _is_truthy(overrides.get("enable_torch_compile", False)):
+            raise ValueError("Qwen3-TTS torch.compile is not supported")
 
     def make_model_runner(self, model_worker: Any, output_proc: Any) -> Any:
         model_runner_mod = importlib.import_module(
@@ -117,7 +125,11 @@ class Qwen3TtsEngineBuilder(TtsEngineBuilder):
         return request_builder, result_adapter
 
     def extra_scheduler_kwargs(self) -> dict[str, Any]:
-        return {"stream_output_builder": self._stream_output_builder}
+        return {
+            "stream_output_builder": self._stream_output_builder,
+            "request_build_max_workers": 4,
+            "request_build_max_pending": 16,
+        }
 
     def make_abort_callback(self) -> Any | None:
         return request_builders.cleanup_prepared_qwen3_tts_request
