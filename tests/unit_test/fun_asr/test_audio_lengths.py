@@ -57,8 +57,11 @@ def test_fun_asr_num_audio_tokens_rejects_invalid_lengths(kwargs: dict) -> None:
         fun_asr_num_audio_tokens(**params)
 
 
-def test_fun_asr_num_audio_tokens_matches_real_feature_extractor() -> None:
-    extractor = FunAsrNanoFeatureExtractor()
+@pytest.mark.parametrize("stride_lfr", [3, 6])
+def test_fun_asr_num_audio_tokens_matches_real_feature_extractor(
+    stride_lfr: int,
+) -> None:
+    extractor = FunAsrNanoFeatureExtractor(stride_lfr=stride_lfr)
     sample_counts = [2, 80, 159, 160, 399, 400, 559, 560, 8079, 8080]
     sample_counts.extend(random.Random(20260812).sample(range(80, 480001), 12))
 
@@ -77,5 +80,5 @@ def test_fun_asr_num_audio_tokens_matches_real_feature_extractor() -> None:
             num_samples,
             frame_length_samples=extractor.n_fft,
             frame_shift_samples=extractor.hop_length,
-            lfr_n=extractor.lfr_n,
+            lfr_n=extractor.stride_lfr,
         ) == int(expected_tokens), num_samples

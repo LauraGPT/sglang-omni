@@ -1,9 +1,10 @@
-from typing import Optional
+from typing import Callable, Optional
 
 import torch
 import torch.nn.functional as F
 from torch import nn
-from x_transformers.x_transformers import apply_rotary_pos_emb
+
+from .rotary import apply_rotary_embedding
 
 _FLASH_ATTN_IMPORT_ERROR: Exception | None = None
 flash_attn_func = None
@@ -28,7 +29,7 @@ def is_flash_attn_available() -> bool:
     )
 
 
-def _raise_flash_attn_unavailable() -> None:
+def raise_flash_attn_unavailable() -> None:
     raise ImportError(
         "Ming flash_attn backend requires the legacy flash_attn API "
         "with flash_attn_func and flash_attn_varlen_func. The installed "
@@ -123,7 +124,7 @@ class Attention(nn.Module):
 
         if attn_backend == "flash_attn":
             if not is_flash_attn_available():
-                _raise_flash_attn_unavailable()
+                raise_flash_attn_unavailable()
 
         self.pe_attn_head = pe_attn_head
         self.attn_backend = attn_backend
@@ -156,24 +157,9 @@ class Attention(nn.Module):
         if self.k_norm is not None:
             key = self.k_norm(key)
 
-        # apply rotary position embedding
-        if rope is not None:
-            freqs, xpos_scale = rope
-            q_xpos_scale, k_xpos_scale = (
-                (xpos_scale, xpos_scale**-1.0) if xpos_scale is not None else (1.0, 1.0)
-            )
-
-            if self.pe_attn_head is not None:
-                pn = self.pe_attn_head
-                query[:, :pn, :, :] = apply_rotary_pos_emb(
-                    query[:, :pn, :, :], freqs, q_xpos_scale
-                )
-                key[:, :pn, :, :] = apply_rotary_pos_emb(
-                    key[:, :pn, :, :], freqs, k_xpos_scale
-                )
-            else:
-                query = apply_rotary_pos_emb(query, freqs, q_xpos_scale)
-                key = apply_rotary_pos_emb(key, freqs, k_xpos_scale)
+        query, key = apply_rotary_embedding(
+            query, key, rope, pe_attn_head=self.pe_attn_head
+        )
 
         if self.attn_backend == "torch":
             # mask. e.g. inference got a batch with different target durations, mask out the padding
@@ -206,7 +192,7 @@ class Attention(nn.Module):
 
         elif self.attn_backend == "flash_attn":
             if not is_flash_attn_available():
-                _raise_flash_attn_unavailable()
+                raise_flash_attn_unavailable()
             query = query.transpose(1, 2)  # [b, h, n, d] -> [b, n, h, d]
             key = key.transpose(1, 2)
             value = value.transpose(1, 2)
@@ -260,10 +246,11 @@ class DiTBlock(nn.Module):
         pe_attn_head=None,
         attn_backend="flash_attn",  # "torch" or "flash_attn"
         attn_mask_enabled=True,
+        norm_layer: Callable[[int, float], nn.Module] = RMSNorm,
         **kwargs,
     ):
         super().__init__()
-        self.norm1 = RMSNorm(hidden_size, eps=1e-6)
+        self.norm1 = norm_layer(hidden_size, 1e-6)
         self.attn = Attention(
             dim=hidden_size,
             heads=num_heads,
@@ -274,7 +261,7 @@ class DiTBlock(nn.Module):
             attn_backend=attn_backend,
             attn_mask_enabled=attn_mask_enabled,
         )
-        self.norm2 = RMSNorm(hidden_size, eps=1e-6)
+        self.norm2 = norm_layer(hidden_size, 1e-6)
         self.mlp = FeedForward(
             dim=hidden_size, mult=mlp_ratio, dropout=dropout, approximate="tanh"
         )
@@ -290,9 +277,14 @@ class FinalLayer(nn.Module):
     The final layer of DiT.
     """
 
-    def __init__(self, hidden_size, out_channels):
+    def __init__(
+        self,
+        hidden_size,
+        out_channels,
+        norm_layer: Callable[[int, float], nn.Module] = RMSNorm,
+    ):
         super().__init__()
-        self.norm_final = RMSNorm(hidden_size, eps=1e-6)
+        self.norm_final = norm_layer(hidden_size, 1e-6)
         self.linear = nn.Linear(hidden_size, out_channels, bias=True)
 
     def forward(self, x):
@@ -305,7 +297,7 @@ def modulate(x, shift, scale):
     return x * (1 + scale) + shift
 
 
-class FinalLayer_mlp(nn.Module):
+class FinalLayer_mlp(nn.Module):  # noqa: N801 - Preserve the existing class name.
     """
     The final layer adopted from DiT.
     """

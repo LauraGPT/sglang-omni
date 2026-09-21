@@ -12,6 +12,7 @@ Requires sglang to be importable.
 from __future__ import annotations
 
 import os
+from contextlib import contextmanager
 from types import SimpleNamespace
 from unittest import mock
 
@@ -31,6 +32,15 @@ from sglang_omni.utils import ipc_weights  # noqa: E402
 SGLModelRunner = sglang_model_runner.SGLModelRunner
 
 
+@pytest.fixture(autouse=True)
+def _parallel_bag(monkeypatch):
+    monkeypatch.setattr(
+        sglang_model_runner,
+        "get_parallel",
+        lambda: SimpleNamespace(tp_size=1, pp_size=1),
+    )
+
+
 class SmallModel(nn.Module):
     def __init__(self, fill: float):
         super().__init__()
@@ -45,8 +55,6 @@ def _bare_runner(load_format="auto"):
     runner.server_args = SimpleNamespace(
         load_format=load_format,
         max_total_tokens=1000,
-        tp_size=1,
-        pp_size=1,
         model_path="m",
         revision="r",
         enable_torch_compile=False,
@@ -86,7 +94,7 @@ def test_env_unset_is_stock_path(tmp_path, monkeypatch):
     assert runner._weight_share_record is None
     assert not os.listdir(tmp_path)  # nothing exported anywhere
     # Weight updates stay allowed on the stock path.
-    assert runner._weight_update_blocked_reason() is None
+    assert runner.weight_update_blocked_reason() is None
 
 
 def test_leader_loads_normally_then_exports(tmp_path, monkeypatch):
@@ -103,7 +111,7 @@ def test_leader_loads_normally_then_exports(tmp_path, monkeypatch):
     # Leader-side record kept for the pre-capture identity check (empty here:
     # a CPU model has no IPC-shareable tensors, everything rode the value path).
     assert runner._weight_share_record is not None
-    assert runner._weight_update_blocked_reason() is not None
+    assert runner.weight_update_blocked_reason() is not None
 
 
 def test_follower_dummy_loads_waits_and_attaches(tmp_path, monkeypatch):
@@ -130,7 +138,7 @@ def test_follower_dummy_loads_waits_and_attaches(tmp_path, monkeypatch):
     # Values came from the leader export, not the dummy init.
     assert torch.all(runner.model.linear.weight == 7.0)
     assert runner._weight_share_record is not None
-    assert runner._weight_update_blocked_reason() is not None
+    assert runner.weight_update_blocked_reason() is not None
 
 
 def test_follower_runs_post_attach_hook_after_aliasing(tmp_path, monkeypatch):
@@ -205,6 +213,59 @@ def test_graph_capture_finalizes_post_capture_kv_pool():
         runner.init_cuda_graphs()
 
     assert calls == ["capture", "resize"]
+
+
+def test_graph_capture_pins_sdpa_around_the_upstream_capture():
+    from sglang_omni.platforms import current_platform
+
+    runner = _bare_runner()
+    calls = []
+
+    @contextmanager
+    def fake_pin():
+        calls.append("pin_enter")
+        try:
+            yield
+        finally:
+            calls.append("pin_exit")
+
+    with (
+        get_context().override_server_args(),
+        mock.patch.object(current_platform, "is_xpu", lambda: True),
+        mock.patch.object(current_platform, "graph_capture_attention", fake_pin),
+        mock.patch.object(
+            ModelRunner,
+            "init_cuda_graphs",
+            lambda self, capture_decode_cuda_graph=True: calls.append("capture"),
+        ),
+    ):
+        runner.init_cuda_graphs()
+
+    assert calls == ["pin_enter", "capture", "pin_exit"]
+
+
+def test_a_non_xpu_platform_captures_unwrapped():
+    from sglang_omni.platforms import current_platform
+
+    runner = _bare_runner()
+    calls = []
+
+    def fail_if_entered():
+        raise AssertionError("the pin must not be built off XPU")
+
+    with (
+        get_context().override_server_args(),
+        mock.patch.object(current_platform, "is_xpu", lambda: False),
+        mock.patch.object(current_platform, "graph_capture_attention", fail_if_entered),
+        mock.patch.object(
+            ModelRunner,
+            "init_cuda_graphs",
+            lambda self, capture_decode_cuda_graph=True: calls.append("capture"),
+        ),
+    ):
+        runner.init_cuda_graphs()
+
+    assert calls == ["capture"]
 
 
 def test_graph_capture_reseeds_torch_compile_from_the_exec_bag():

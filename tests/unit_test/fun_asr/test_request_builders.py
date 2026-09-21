@@ -10,9 +10,6 @@ import torch
 
 import sglang_omni.models.fun_asr.request_builders as request_builders
 import sglang_omni.preprocessing.transcription as transcription
-from sglang_omni.models.fun_asr.tool_funcs.audio_lengths import (
-    fun_asr_low_frame_rate_length,
-)
 from sglang_omni.proto import OmniRequest, StagePayload
 from sglang_omni.utils.audio import audio_fingerprint
 
@@ -91,15 +88,16 @@ def _feature_extractor(num_lfr_frames: int):
 
     _call.n_fft = 400
     _call.hop_length = 160
-    _call.lfr_n = 6
+    _call.stride_lfr = 6
     return _call
 
 
-def test_fun_asr_request_builder_records_inclusive_audio_offsets(monkeypatch) -> None:
-    # 17 LFR frames -> three ceil(x/2) reductions: 17->9->5->3 audio tokens
+def test_fun_asr_request_builder_records_inclusive_audio_offsets(
+    monkeypatch,
+) -> None:
     num_lfr_frames = 17
-    num_audio_tokens = fun_asr_low_frame_rate_length(num_lfr_frames)
-    assert num_audio_tokens == 3
+    num_audio_tokens = 3
+    extractor = _feature_extractor(num_lfr_frames)
 
     monkeypatch.setattr(
         transcription,
@@ -109,7 +107,7 @@ def test_fun_asr_request_builder_records_inclusive_audio_offsets(monkeypatch) ->
     request_builder, _ = request_builders.make_fun_asr_scheduler_adapters(
         tokenizer=_FakeTokenizer(),
         max_new_tokens=32,
-        feature_extractor=_feature_extractor(num_lfr_frames),
+        feature_extractor=extractor,
     )
     payload = StagePayload(
         request_id="req-fun-asr",
@@ -194,7 +192,7 @@ def test_fun_asr_embedding_cache_hit_skips_feature_extraction(monkeypatch) -> No
     class _UnexpectedFeatureExtractor:
         n_fft = 400
         hop_length = 160
-        lfr_n = 6
+        stride_lfr = 6
 
         def __call__(self, *args, **kwargs):
             raise AssertionError("feature extractor should not be called")
@@ -230,6 +228,7 @@ def test_fun_asr_embedding_cache_hit_skips_feature_extraction(monkeypatch) -> No
 
     item = data.req.multimodal_inputs.mm_items[0]
     assert data.num_audio_tokens == 3
+    assert data.enforce_request_limits is True
     assert item.feature is None
     assert item.precomputed_embeddings is embedding
     assert item.offsets[0][1] - item.offsets[0][0] + 1 == 3
@@ -441,6 +440,30 @@ def test_fun_asr_request_builder_rejects_audio_over_vad_limit(monkeypatch) -> No
 
     with pytest.raises(ValueError, match=r"30(?:\.0)? seconds.*VAD"):
         request_builder(payload)
+
+
+def test_fun_asr_request_builder_enforces_scheduler_request_limits(
+    monkeypatch,
+) -> None:
+    monkeypatch.setattr(
+        transcription,
+        "load_audio",
+        lambda source, **kwargs: np.zeros(1600, dtype=np.float32),
+    )
+    request_builder, _ = request_builders.make_fun_asr_scheduler_adapters(
+        tokenizer=_FakeTokenizer(),
+        max_new_tokens=16,
+        feature_extractor=_feature_extractor(17),
+    )
+    payload = StagePayload(
+        request_id="req-fun-asr-request-limits",
+        request=OmniRequest(inputs={"audio_bytes": b"wav"}, params={}),
+        data={},
+    )
+
+    data = request_builder(payload)
+
+    assert data.enforce_request_limits is True
 
 
 def test_fun_asr_request_builder_rejects_explicit_token_budget_over_cap(

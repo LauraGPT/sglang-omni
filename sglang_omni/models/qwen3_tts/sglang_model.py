@@ -3,25 +3,33 @@
 
 from __future__ import annotations
 
+import gc
 import logging
+import math
 import os
+import time
 from contextlib import contextmanager
 from typing import Any, Iterable, Optional, Tuple
 
 import torch
+from sglang.kernels.fused_op import get_fused_op_backend
+from sglang.kernels.spec import KernelBackend
+from sglang.srt.batch_invariant_ops import is_batch_invariant_mode_enabled
 from sglang.srt.layers.logits_processor import LogitsProcessorOutput
-from sglang.srt.layers.quantization.unquant import UnquantizedLinearMethod
-from sglang.srt.layers.sampler import multinomial_with_seed
-from sglang.srt.model_executor.runner_backend_utils.breakable_cuda_graph import (
-    eager_on_graph,
+from sglang.srt.layers.quantization.unquant import (
+    UnquantizedLinearMethod,
+    get_bf16_gemm_backend,
 )
+from sglang.srt.layers.sampler import multinomial_with_seed
+from sglang.srt.runtime_context import get_exec, get_parallel
 from sglang.srt.utils import add_prefix
+from sglang.srt.utils.common import is_pin_memory_available
 from torch import nn
 
 from sglang_omni.models.qwen3_omni.components.talker import (  # noqa: E501
     Qwen3OmniMoeTalkerDenseMLP,
     ResizeMLP,
-    _bind_default_weight_loaders,
+    bind_default_weight_loaders,
 )
 from sglang_omni.models.qwen3_omni.components.thinker_model import (
     Qwen3OmniMoeThinkerTextAttention,
@@ -34,34 +42,71 @@ from sglang_omni.models.qwen3_tts.predictor_kernels import (
 )
 from sglang_omni.models.qwen3_tts.sampling_kernels import (
     sample_from_logits_with_seed_top_k_top_p,
+    sample_from_logprobs_with_seed_npu,
     sample_from_sorted_logprobs_with_seed_small_k,
 )
+from sglang_omni.platforms import current_platform
 from sglang_omni.vendor.sglang.core import ForwardBatch
 from sglang_omni.vendor.sglang.layers import ReplicatedLinear, RMSNorm
-from sglang_omni.vendor.sglang.models import apply_qk_norm
+from sglang_omni.vendor.sglang.models import FusedSetKVBufferArg, apply_qk_norm
 from sglang_omni.vendor.sglang.server_args import get_global_server_args
 
 logger = logging.getLogger(__name__)
 
 QTTS_PREDICTOR_GRAPH_ENV = "SGLANG_OMNI_QTTS_PREDICTOR_GRAPH"
-_PREDICTOR_GRAPH_MAX_KEYS = 32
+_PREDICTOR_GRAPH_MAX_LAZY_KEYS = 32
 _PREDICTOR_GRAPH_MAX_FAILURES = 8
+_PREDICTOR_GRAPH_WARMUP_PASSES = 2
 # Note: (Jiaxin Deng) 50 is on the ladder because it is the family checkpoint
 # default, keeping the dominant signature's kernel width exactly as before.
 _PREDICTOR_TOP_K_LADDER = (4, 8, 16, 32, 50, 64, 128, 256, 512, 1024)
 
 
-def _install_breakable_prefill_qk_norm_rope_graph_break(attention: Any) -> None:
-    """Keep Qwen3-TTS QK norm and RoPE outside breakable graph segments."""
-    attention.apply_qk_norm_rope = eager_on_graph(True)(attention.apply_qk_norm_rope)
+def predictor_graph_env_override() -> bool | None:
+    """The operator's explicit choice, or None to leave it to the platform."""
+    value = os.environ.get(QTTS_PREDICTOR_GRAPH_ENV)
+    if value is None:
+        return None
+    return value.strip().lower() not in ("0", "false", "off", "no")
 
 
-def _predictor_graph_env_enabled() -> bool:
-    value = os.environ.get(QTTS_PREDICTOR_GRAPH_ENV, "1").strip().lower()
-    return value not in ("0", "false", "off", "no")
+def predictor_gqa_attention(
+    q: torch.Tensor,
+    key: torch.Tensor,
+    value: torch.Tensor,
+    *,
+    num_heads: int,
+    num_key_value_heads: int,
+) -> torch.Tensor:
+    """Run Predictor GQA, preferring Ascend's inference kernel on NPU."""
+    if q.device.type == "npu":
+        fused_attention = getattr(
+            getattr(torch.ops, "npu", None),
+            "npu_fused_infer_attention_score",
+            None,
+        )
+        if fused_attention is not None:
+            output, _ = fused_attention(
+                q.transpose(1, 2).contiguous(),
+                key.transpose(1, 2).contiguous(),
+                value.transpose(1, 2).contiguous(),
+                num_heads=num_heads,
+                num_key_value_heads=num_key_value_heads,
+                input_layout="BSND",
+                scale=1.0 / math.sqrt(q.shape[-1]),
+            )
+            return output.transpose(1, 2)
+
+    return torch.nn.functional.scaled_dot_product_attention(
+        q,
+        key,
+        value,
+        is_causal=False,
+        enable_gqa=True,
+    )
 
 
-def _quantize_predictor_top_k(max_top_k: int, vocab_size: int) -> int | None:
+def quantize_predictor_top_k(max_top_k: int, vocab_size: int) -> int | None:
     """Smallest ladder width covering max_top_k, or None to use the full sort."""
     for step in _PREDICTOR_TOP_K_LADDER:
         if step >= max_top_k:
@@ -69,37 +114,65 @@ def _quantize_predictor_top_k(max_top_k: int, vocab_size: int) -> int | None:
     return None
 
 
-def _sample_seeded_categorical(
+def predictor_signature_terms(
+    sampled_top_ks: list[int],
+    sampled_top_ps: list[float],
+    vocab_size: int,
+) -> tuple[int, bool, bool]:
+    """The one signature rule, shared by the batch path and the startup capture."""
+    bounded_top_ks = [
+        int(top_k) for top_k in sampled_top_ks if 0 < int(top_k) < vocab_size
+    ]
+    has_top_p = any(0.0 < float(top_p) < 1.0 for top_p in sampled_top_ps)
+    has_unbounded_top_k = len(bounded_top_ks) != len(sampled_top_ks)
+    max_top_k = 0
+    max_bounded_top_k = max(bounded_top_ks, default=0)
+    if max_bounded_top_k > 0 and not has_unbounded_top_k:
+        # Note: (Jiaxin Deng) ladder-quantized so predictor-graph keys are
+        # shared across request top_k values; per-row masks keep true k.
+        quantized = quantize_predictor_top_k(max_bounded_top_k, vocab_size)
+        if quantized is None:
+            has_unbounded_top_k = True
+        else:
+            max_top_k = quantized
+    return max_top_k, has_top_p, has_unbounded_top_k
+
+
+def sample_seeded_categorical(
     logprobs: torch.Tensor,
     seeds: torch.Tensor,
     positions: torch.Tensor,
 ) -> torch.Tensor:
+    if logprobs.device.type == "npu":
+        return sample_from_logprobs_with_seed_npu(logprobs, seeds, positions)
     return multinomial_with_seed(logprobs, seeds, positions).view(-1)
 
 
-class _PredictorDecodeGraph:
-    """CUDA graph over the full per-token predictor chain for one batch bucket.
+class PredictorDecodeGraph:
+    """Device graph over the full per-token predictor chain for one batch bucket.
 
     One graph per (bucket, sampling signature): the signature pins the host
-    branches of the eager sampling path (argmax vs sampled, top-k bound,
-    top-p presence), so replay reproduces the eager sampling bits.
+    branches of the sampling path (argmax vs sampled, top-k bound, top-p
+    presence), so replay reproduces the bits of the eager pass.
     Per-step inputs reach the captured region through persistent device
-    buffers written with device-side copies before replay.
+    buffers written with device-side copies before replay. Holds no reference
+    to the talker: a cycle would put the graph's finalizer behind the
+    cyclic collector.
     """
 
     def __init__(
         self,
-        model: "Qwen3TTSTalker",
         batch_size: int,
         signature: tuple,
         *,
+        device: torch.device,
         hidden_size: int,
         hidden_dtype: torch.dtype,
     ) -> None:
-        self.model = model
         self.batch_size = batch_size
         self.signature = signature
-        device = model._predictor_k_cache.device
+        self.device = device
+        self.device_module = torch.get_device_module(device)
         self.layer0_codes = torch.zeros(batch_size, 1, dtype=torch.long, device=device)
         self.talker_hidden = torch.zeros(
             batch_size, 1, hidden_size, dtype=hidden_dtype, device=device
@@ -107,61 +180,9 @@ class _PredictorDecodeGraph:
         self.semantic_positions = torch.zeros(
             batch_size, dtype=torch.long, device=device
         )
-        self.graph = torch.cuda.CUDAGraph()
+        self.graph: Any | None = None
         self.result_codes: torch.Tensor | None = None
         self.summed_embeddings: torch.Tensor | None = None
-        try:
-            self._capture()
-        except Exception:
-            # Note: (Jiaxin Deng) release the graph's private memory pool
-            # eagerly; the raising object may linger on traceback frames.
-            try:
-                self.graph.reset()
-            except Exception:
-                pass
-            raise
-
-    @torch.no_grad()
-    def _capture(self) -> None:
-        model = self.model
-        device = self.layer0_codes.device
-        with (
-            torch.cuda.device(device),
-            model._predictor_graph_capture_state(self.batch_size, self.signature),
-        ):
-            current_stream = torch.cuda.current_stream(device=device)
-            warmup_stream = torch.cuda.Stream(device=device)
-            warmup_stream.wait_stream(current_stream)
-            with torch.cuda.stream(warmup_stream):
-                for _ in range(2):
-                    model._code_predictor_forward_incremental(
-                        self.layer0_codes,
-                        self.talker_hidden,
-                        semantic_positions=self.semantic_positions,
-                        for_capture=True,
-                    )
-            current_stream.wait_stream(warmup_stream)
-
-            capture_stream = torch.cuda.Stream(device=device)
-            capture_stream.wait_stream(current_stream)
-            with torch.cuda.graph(
-                self.graph,
-                pool=model._predictor_graph_memory_pool(),
-                stream=capture_stream,
-                capture_error_mode="thread_local",
-            ):
-                self.result_codes, self.summed_embeddings = (
-                    model._code_predictor_forward_incremental(
-                        self.layer0_codes,
-                        self.talker_hidden,
-                        semantic_positions=self.semantic_positions,
-                        for_capture=True,
-                    )
-                )
-            current_stream.wait_stream(capture_stream)
-
-        if self.result_codes is None or self.summed_embeddings is None:
-            raise RuntimeError("Qwen3-TTS predictor CUDA graph captured no outputs")
 
     @torch.no_grad()
     def replay(
@@ -173,10 +194,10 @@ class _PredictorDecodeGraph:
         live = layer0_codes.shape[0]
         if live > self.batch_size:
             raise ValueError(
-                "Qwen3-TTS predictor CUDA graph bucket is too small: "
+                "Qwen3-TTS predictor graph bucket is too small: "
                 f"bucket={self.batch_size}, live={live}"
             )
-        with torch.cuda.device(self.layer0_codes.device):
+        with self.device_module.device(self.device):
             self.layer0_codes[:live].copy_(layer0_codes)
             self.talker_hidden[:live].copy_(talker_hidden)
             if semantic_positions is None:
@@ -213,11 +234,6 @@ class Qwen3TTSTalkerDecoderLayer(nn.Module):
             dual_chunk_attention_config=None,
             alt_stream=None,
         )
-        # Capturing the packed QKV normalization and RoPE block corrupts
-        # Qwen3-TTS prefill replay. Keep this narrow block eager while the
-        # surrounding projections and MLP remain captured. Decode execution
-        # runs outside the breakable-prefill context and is unchanged.
-        _install_breakable_prefill_qk_norm_rope_graph_break(self.self_attn)
         self.mlp = Qwen3OmniMoeTalkerDenseMLP(
             config.hidden_size,
             config.intermediate_size,
@@ -299,7 +315,7 @@ class Qwen3TTSTalkerTextModel(nn.Module):
     def get_text_embeddings(self):
         return self.text_embedding
 
-    def _build_input_hidden_states(
+    def build_input_hidden_states(
         self,
         input_ids: torch.Tensor,
     ) -> torch.Tensor:
@@ -325,7 +341,7 @@ class Qwen3TTSTalkerTextModel(nn.Module):
             if is_decode:
                 hidden_states = self._decode_feedback_embedding(input_ids)
             else:
-                hidden_states = self._build_input_hidden_states(input_ids)
+                hidden_states = self.build_input_hidden_states(input_ids)
         else:
             hidden_states = input_embeds
 
@@ -391,7 +407,466 @@ class Qwen3TTSCodePredictor(nn.Module):
         return self.small_to_mtp_projection(hidden_states)
 
 
-class Qwen3TTSTalker(nn.Module):
+class Qwen3TTSPromptBuilderMixin:
+    """Prompt construction shared by the talker and the standalone prompt frontend.
+
+    Expects ``model`` (embedding tables and ``_feedback_buffer``), ``text_projection``,
+    ``code_predictor.model.codec_embedding``, ``speaker_encoder``, ``speech_tokenizer``,
+    ``config``/``root_config`` and ``speaker_encoder_sample_rate`` on the instance.
+    """
+
+    @property
+    def device(self) -> torch.device:
+        return self.model.codec_embedding.weight.device
+
+    @property
+    def dtype(self) -> torch.dtype:
+        return self.model.codec_embedding.weight.dtype
+
+    def get_input_embeddings(self):
+        return self.model.get_input_embeddings()
+
+    def get_text_embeddings(self):
+        return self.model.get_text_embeddings()
+
+    def load_speech_tokenizer(self, speech_tokenizer: Any) -> None:
+        self.speech_tokenizer = speech_tokenizer
+
+    def get_supported_languages(self):
+        return ["auto", *list(self.config.codec_language_id.keys())]
+
+    def get_supported_speakers(self):
+        return (getattr(self.config, "spk_id", None) or {}).keys()
+
+    @torch.inference_mode()
+    def extract_speaker_embedding(self, audio, sr):
+        apply_qwen_tts_transformers_compatibility_patches()
+        from qwen_tts.core.models.modeling_qwen3_tts import mel_spectrogram
+
+        if sr != self.speaker_encoder_sample_rate:
+            raise ValueError(
+                f"Expected {self.speaker_encoder_sample_rate}Hz reference audio"
+            )
+        if self.speaker_encoder is None:
+            raise RuntimeError("Qwen3-TTS speaker encoder is not loaded")
+        mels = mel_spectrogram(
+            torch.from_numpy(audio).unsqueeze(0),
+            n_fft=1024,
+            num_mels=128,
+            sampling_rate=self.speaker_encoder_sample_rate,
+            hop_size=256,
+            win_size=1024,
+            fmin=0,
+            fmax=12000,
+        ).transpose(1, 2)
+        return self.speaker_encoder(mels.to(self.device).to(self.dtype))[0]
+
+    @torch.inference_mode()
+    def generate_speaker_prompt(self, voice_clone_prompt: dict[str, Any]):
+        return [
+            emb.to(self.device).to(self.dtype)
+            for emb in voice_clone_prompt["ref_spk_embedding"]
+        ]
+
+    def build_instruct_embed(
+        self,
+        instruct_id: torch.Tensor | None,
+    ) -> torch.Tensor | None:
+        if instruct_id is None:
+            return None
+        return self.text_projection(self.get_text_embeddings()(instruct_id))
+
+    def build_tts_special_embeds(
+        self,
+        *,
+        dtype: torch.dtype,
+    ) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
+        ids = torch.tensor(
+            [
+                [
+                    self.root_config.tts_bos_token_id,
+                    self.root_config.tts_eos_token_id,
+                    self.root_config.tts_pad_token_id,
+                ]
+            ],
+            device=self.device,
+            dtype=dtype,
+        )
+        return self.text_projection(self.get_text_embeddings()(ids)).chunk(3, dim=1)
+
+    def resolve_language_id(
+        self,
+        *,
+        language: str,
+        voice: str | None = None,
+    ) -> int | None:
+        # Note(yzxiao): QwenLM/Qwen3-TTS (qwen-tts 0.1.1) also applies speaker
+        # dialects to Chinese. Keep explicit languages unchanged here so existing
+        # Chinese requests do not switch to a dialect when using Eric or Dylan.
+        if language.lower() != "auto":
+            return self.config.codec_language_id[language.lower()]
+        if voice is None:
+            return None
+        spk_is_dialect = getattr(self.config, "spk_is_dialect", None) or {}
+        dialect = spk_is_dialect.get(voice.lower())
+        if isinstance(dialect, str) and dialect:
+            return self.config.codec_language_id.get(dialect)
+        return None
+
+    def build_codec_prefill(
+        self,
+        *,
+        language: str,
+        dtype: torch.dtype,
+        voice: str | None = None,
+    ) -> torch.Tensor:
+        language_id = self.resolve_language_id(language=language, voice=voice)
+        if language_id is None:
+            codec_prefill = [
+                self.config.codec_nothink_id,
+                self.config.codec_think_bos_id,
+                self.config.codec_think_eos_id,
+            ]
+        else:
+            codec_prefill = [
+                self.config.codec_think_id,
+                self.config.codec_think_bos_id,
+                language_id,
+                self.config.codec_think_eos_id,
+            ]
+        return self.get_input_embeddings()(
+            torch.tensor([codec_prefill], device=self.device, dtype=dtype)
+        )
+
+    def finish_text_prompt(
+        self,
+        *,
+        talker_input_embed: torch.Tensor,
+        input_id: torch.Tensor,
+        codec_last_embed: torch.Tensor,
+        tts_pad_embed: torch.Tensor,
+        tts_eos_embed: torch.Tensor,
+        non_streaming_mode: bool,
+    ) -> tuple[torch.Tensor, torch.Tensor]:
+        if non_streaming_mode:
+            text_all = self.text_projection(
+                self.get_text_embeddings()(input_id[:, 3:-5])
+            )
+            text_all = torch.cat([text_all, tts_eos_embed], dim=1)
+            pad_ids = torch.full(
+                (1, int(text_all.shape[1])),
+                int(self.config.codec_pad_id),
+                device=self.device,
+                dtype=input_id.dtype,
+            )
+            talker_input_embed = torch.cat(
+                [
+                    talker_input_embed,
+                    text_all + self.get_input_embeddings()(pad_ids),
+                    tts_pad_embed
+                    + self.get_input_embeddings()(
+                        torch.tensor(
+                            [[self.config.codec_bos_id]],
+                            device=self.device,
+                            dtype=input_id.dtype,
+                        )
+                    ),
+                ],
+                dim=1,
+            )
+            return talker_input_embed, tts_pad_embed
+
+        first_text = (
+            self.text_projection(self.get_text_embeddings()(input_id[:, 3:4]))
+            + codec_last_embed
+        )
+        talker_input_embed = torch.cat([talker_input_embed, first_text], dim=1)
+        trailing_text_hidden = torch.cat(
+            [
+                self.text_projection(self.get_text_embeddings()(input_id[:, 4:-5])),
+                tts_eos_embed,
+            ],
+            dim=1,
+        )
+        return talker_input_embed, trailing_text_hidden
+
+    def apply_instruct_prefix(
+        self,
+        talker_input_embed: torch.Tensor,
+        instruct_id: torch.Tensor | None,
+    ) -> torch.Tensor:
+        instruct_embed = self.build_instruct_embed(instruct_id)
+        if instruct_embed is None:
+            return talker_input_embed
+        return torch.cat([instruct_embed, talker_input_embed], dim=1)
+
+    def build_conditioned_prompt_prefix(
+        self,
+        *,
+        input_id: torch.Tensor,
+        codec_input: torch.Tensor,
+        tts_bos_embed: torch.Tensor,
+        tts_pad_embed: torch.Tensor,
+    ) -> torch.Tensor:
+        role_embed = self.text_projection(self.get_text_embeddings()(input_id[:, :3]))
+        prompt_embed = (
+            torch.cat(
+                [tts_pad_embed.expand(-1, codec_input.shape[1] - 2, -1), tts_bos_embed],
+                dim=1,
+            )
+            + codec_input[:, :-1]
+        )
+        return torch.cat([role_embed, prompt_embed], dim=1)
+
+    def build_voice_clone_inputs(
+        self,
+        *,
+        input_id: torch.Tensor,
+        ref_id: torch.Tensor | None,
+        voice_clone_prompt: dict[str, Any],
+        language: str,
+        non_streaming_mode: bool,
+        instruct_id: torch.Tensor | None = None,
+    ) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor | None]:
+        voice_clone_spk_embeds = self.generate_speaker_prompt(voice_clone_prompt)
+        speaker_embed = voice_clone_spk_embeds[0]
+
+        tts_bos_embed, tts_eos_embed, tts_pad_embed = self.build_tts_special_embeds(
+            dtype=input_id.dtype
+        )
+        codec_input_0 = self.build_codec_prefill(
+            language=language,
+            dtype=input_id.dtype,
+        )
+        codec_input_1 = self.get_input_embeddings()(
+            torch.tensor(
+                [[self.config.codec_pad_id, self.config.codec_bos_id]],
+                device=self.device,
+                dtype=input_id.dtype,
+            )
+        )
+        codec_input = torch.cat(
+            [codec_input_0, speaker_embed.view(1, 1, -1), codec_input_1], dim=1
+        )
+        talker_input_embed = self.build_conditioned_prompt_prefix(
+            input_id=input_id,
+            codec_input=codec_input,
+            tts_bos_embed=tts_bos_embed,
+            tts_pad_embed=tts_pad_embed,
+        )
+
+        ref_code = None
+        ref_codes = voice_clone_prompt.get("ref_code")
+        if ref_codes is not None:
+            ref_code = ref_codes[0]
+
+        if ref_code is not None and voice_clone_prompt["icl_mode"][0]:
+            if ref_id is None:
+                raise ValueError("Qwen3-TTS ICL mode requires ref_text tokens")
+            icl_embed, trailing_text_hidden = self.generate_icl_prompt(
+                text_id=input_id[:, 3:-5],
+                ref_id=ref_id[:, 3:-2],
+                ref_code=ref_code.to(self.device),
+                tts_pad_embed=tts_pad_embed,
+                tts_eos_embed=tts_eos_embed,
+                non_streaming_mode=non_streaming_mode,
+            )
+            talker_input_embed = torch.cat([talker_input_embed, icl_embed], dim=1)
+        else:
+            talker_input_embed, trailing_text_hidden = self.finish_text_prompt(
+                talker_input_embed=talker_input_embed,
+                input_id=input_id,
+                codec_last_embed=codec_input[:, -1:],
+                tts_pad_embed=tts_pad_embed,
+                tts_eos_embed=tts_eos_embed,
+                non_streaming_mode=non_streaming_mode,
+            )
+
+        talker_input_embed = self.apply_instruct_prefix(
+            talker_input_embed,
+            instruct_id,
+        )
+        attention_mask = torch.ones(
+            (1, talker_input_embed.shape[1]), device=self.device, dtype=torch.long
+        )
+        return talker_input_embed, attention_mask, trailing_text_hidden, ref_code
+
+    def build_custom_voice_inputs(
+        self,
+        *,
+        input_id: torch.Tensor,
+        voice: str,
+        language: str,
+        non_streaming_mode: bool,
+        instruct_id: torch.Tensor | None = None,
+    ) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor, None]:
+        spk_id = getattr(self.config, "spk_id", None) or {}
+        if not spk_id:
+            raise ValueError(
+                "Qwen3-TTS CustomVoice requires a checkpoint with configured spk_id"
+            )
+        speaker_key = voice.lower()
+        spk_id_map = {str(key).lower(): value for key, value in spk_id.items()}
+        if speaker_key not in spk_id_map:
+            supported = ", ".join(sorted(str(key) for key in spk_id))
+            raise ValueError(
+                f"Unsupported Qwen3-TTS CustomVoice speaker {voice!r}. "
+                f"Supported speakers: {supported}"
+            )
+
+        tts_bos_embed, tts_eos_embed, tts_pad_embed = self.build_tts_special_embeds(
+            dtype=input_id.dtype
+        )
+        codec_input_0 = self.build_codec_prefill(
+            language=language,
+            dtype=input_id.dtype,
+            voice=speaker_key,
+        )
+        speaker_embed = self.get_input_embeddings()(
+            torch.tensor(
+                [spk_id_map[speaker_key]], device=self.device, dtype=input_id.dtype
+            )
+        ).view(1, 1, -1)
+        codec_input_1 = self.get_input_embeddings()(
+            torch.tensor(
+                [[self.config.codec_pad_id, self.config.codec_bos_id]],
+                device=self.device,
+                dtype=input_id.dtype,
+            )
+        )
+        codec_input = torch.cat([codec_input_0, speaker_embed, codec_input_1], dim=1)
+        talker_input_embed = self.build_conditioned_prompt_prefix(
+            input_id=input_id,
+            codec_input=codec_input,
+            tts_bos_embed=tts_bos_embed,
+            tts_pad_embed=tts_pad_embed,
+        )
+        talker_input_embed, trailing_text_hidden = self.finish_text_prompt(
+            talker_input_embed=talker_input_embed,
+            input_id=input_id,
+            codec_last_embed=codec_input[:, -1:],
+            tts_pad_embed=tts_pad_embed,
+            tts_eos_embed=tts_eos_embed,
+            non_streaming_mode=non_streaming_mode,
+        )
+        talker_input_embed = self.apply_instruct_prefix(
+            talker_input_embed,
+            instruct_id,
+        )
+        attention_mask = torch.ones(
+            (1, talker_input_embed.shape[1]), device=self.device, dtype=torch.long
+        )
+        return talker_input_embed, attention_mask, trailing_text_hidden, None
+
+    def build_voice_design_inputs(
+        self,
+        *,
+        input_id: torch.Tensor,
+        language: str,
+        non_streaming_mode: bool,
+        instruct_id: torch.Tensor | None,
+    ) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor, None]:
+        if instruct_id is None:
+            raise ValueError("Qwen3-TTS VoiceDesign requires instructions")
+
+        tts_bos_embed, tts_eos_embed, tts_pad_embed = self.build_tts_special_embeds(
+            dtype=input_id.dtype
+        )
+        codec_input_0 = self.build_codec_prefill(
+            language=language,
+            dtype=input_id.dtype,
+        )
+        codec_input_1 = self.get_input_embeddings()(
+            torch.tensor(
+                [[self.config.codec_pad_id, self.config.codec_bos_id]],
+                device=self.device,
+                dtype=input_id.dtype,
+            )
+        )
+        codec_input = torch.cat([codec_input_0, codec_input_1], dim=1)
+        talker_input_embed = self.build_conditioned_prompt_prefix(
+            input_id=input_id,
+            codec_input=codec_input,
+            tts_bos_embed=tts_bos_embed,
+            tts_pad_embed=tts_pad_embed,
+        )
+        talker_input_embed, trailing_text_hidden = self.finish_text_prompt(
+            talker_input_embed=talker_input_embed,
+            input_id=input_id,
+            codec_last_embed=codec_input[:, -1:],
+            tts_pad_embed=tts_pad_embed,
+            tts_eos_embed=tts_eos_embed,
+            non_streaming_mode=non_streaming_mode,
+        )
+        talker_input_embed = self.apply_instruct_prefix(
+            talker_input_embed,
+            instruct_id,
+        )
+        attention_mask = torch.ones(
+            (1, talker_input_embed.shape[1]), device=self.device, dtype=torch.long
+        )
+        return talker_input_embed, attention_mask, trailing_text_hidden, None
+
+    def generate_icl_prompt(
+        self,
+        text_id: torch.Tensor,
+        ref_id: torch.Tensor,
+        ref_code: torch.Tensor,
+        tts_pad_embed: torch.Tensor,
+        tts_eos_embed: torch.Tensor,
+        non_streaming_mode: bool,
+    ):
+        text_embed = self.text_projection(
+            self.get_text_embeddings()(torch.cat([ref_id, text_id], dim=-1))
+        )
+        text_embed = torch.cat([text_embed, tts_eos_embed], dim=1)
+        codec_embed = []
+        for idx in range(self.config.num_code_groups):
+            if idx == 0:
+                codec_embed.append(self.get_input_embeddings()(ref_code[:, :1]))
+            else:
+                codec_embed.append(
+                    self.code_predictor.model.codec_embedding[idx - 1](
+                        ref_code[:, idx : idx + 1]
+                    )
+                )
+        codec_embed = torch.cat(codec_embed, dim=1).sum(1).unsqueeze(0)
+        codec_embed = torch.cat(
+            [
+                self.get_input_embeddings()(
+                    torch.tensor(
+                        [[self.config.codec_bos_id]],
+                        device=self.device,
+                        dtype=text_id.dtype,
+                    )
+                ),
+                codec_embed,
+            ],
+            dim=1,
+        )
+        text_lens = text_embed.shape[1]
+        codec_lens = codec_embed.shape[1]
+        if non_streaming_mode:
+            icl_input_embed = text_embed + self.get_input_embeddings()(
+                torch.tensor(
+                    [[self.config.codec_pad_id] * text_lens],
+                    device=self.device,
+                    dtype=text_id.dtype,
+                )
+            )
+            icl_input_embed = torch.cat(
+                [icl_input_embed, codec_embed + tts_pad_embed], dim=1
+            )
+            return icl_input_embed, tts_pad_embed
+        if text_lens > codec_lens:
+            return text_embed[:, :codec_lens] + codec_embed, text_embed[:, codec_lens:]
+        text_embed = torch.cat(
+            [text_embed] + [tts_pad_embed] * (codec_lens - text_lens), dim=1
+        )
+        return text_embed + codec_embed, tts_pad_embed
+
+
+class Qwen3TTSTalker(Qwen3TTSPromptBuilderMixin, nn.Module):
     """Qwen3-TTS Base talker with SGLang-managed KV cache for the main AR loop."""
 
     # The outer forward substitutes ForwardBatch.mrope_positions whenever they
@@ -467,16 +942,36 @@ class Qwen3TTSTalker(nn.Module):
             .expand(predictor_len, max_batch_size)
             .contiguous()
         )
+        self._predictor_device = device
+        self._predictor_device_module = torch.get_device_module(device)
+        # note(ratish): slot major, so the rope kernel stores k and v as one
+        # row per (batch row, slot) and the attention reads a transposed view.
         self._predictor_k_cache = torch.zeros(
             len(cp_layers),
             max_batch_size,
-            cp_attn.num_kv_heads,
             predictor_len,
+            cp_attn.num_kv_heads,
             cp_attn.head_dim,
             device=device,
             dtype=dtype,
         )
         self._predictor_v_cache = torch.zeros_like(self._predictor_k_cache)
+        self._predictor_k_rows = [
+            layer_cache.view(max_batch_size * predictor_len, -1)
+            for layer_cache in self._predictor_k_cache
+        ]
+        self._predictor_v_rows = [
+            layer_cache.view(max_batch_size * predictor_len, -1)
+            for layer_cache in self._predictor_v_cache
+        ]
+        self._predictor_cache_slots = (
+            torch.arange(max_batch_size, device=device, dtype=torch.long)[None, :]
+            * predictor_len
+            + self._predictor_positions[:, None]
+        ).contiguous()
+        self._predictor_rope_stores_kv = self.resolve_predictor_rope_store(
+            cp_attn, device=device
+        )
         self._sampled_token_ids = torch.zeros(
             max_batch_size, dtype=torch.long, device=device
         )
@@ -493,7 +988,6 @@ class Qwen3TTSTalker(nn.Module):
             max_batch_size, hidden_size, device=device, dtype=dtype
         )
         self._sub_batch_size = 0
-        self._sub_sample_max_row_index = -1
         self._sub_temperature_tensor = torch.full(
             (max_batch_size,), 0.9, device=device, dtype=torch.float32
         )
@@ -512,482 +1006,34 @@ class Qwen3TTSTalker(nn.Module):
         self._sub_do_sample_tensor = torch.zeros(
             max_batch_size, device=device, dtype=torch.bool
         )
-        self._sub_identity_row_indices_tensor = torch.arange(
-            max_batch_size, device=device, dtype=torch.long
+        self._sub_seed_offsets = torch.arange(
+            1, config.num_code_groups, device=device, dtype=torch.long
         )
-        self._sub_sample_row_indices_tensor = torch.zeros(
-            max_batch_size, device=device, dtype=torch.long
-        )
-        self._sub_sample_count = 0
         self._sub_has_sampled_rows = False
+        self._sub_has_argmax_rows = False
         self._sub_sampled_has_top_p = False
         self._sub_sampled_max_top_k = 0
         self._sub_sampled_has_unbounded_top_k = False
         self._decode_prep_rids: list | None = None
-        self._predictor_graph_batch_sizes = self._normalize_predictor_graph_batch_sizes(
+        self._predictor_graph_batch_sizes = self.normalize_predictor_graph_batch_sizes(
             server_args,
             max_batch_size=max_batch_size,
         )
-        self._predictor_graphs: dict[tuple, _PredictorDecodeGraph] = {}
+        self._predictor_graphs: dict[tuple, PredictorDecodeGraph] = {}
         self._predictor_graph_disabled: set[tuple] = set()
-        # Note: (Jiaxin Deng) None = resolved at decode time; the bootstrap
-        # defers graph capture past init, so nothing is decided here.
+        # note(ratish): None until the startup capture, which runs before the
+        # KV pool is sized, or the first decode resolves it.
         self._predictor_graph_enabled: bool | None = None
         self._predictor_graph_failure_count = 0
         self._predictor_graph_capacity_fallback_count = 0
         self._predictor_graph_capacity_warned = False
         self._predictor_graph_capture_count = 0
+        self._predictor_graph_startup_count = 0
         self._predictor_graph_pool = None
-        _bind_default_weight_loaders(self)
+        self._predictor_capture_stream: torch.Stream | None = None
+        bind_default_weight_loaders(self)
         self._cached_params_dict = dict(self.named_parameters())
         self._sampler = None
-
-    @property
-    def device(self) -> torch.device:
-        return self.model.codec_embedding.weight.device
-
-    @property
-    def dtype(self) -> torch.dtype:
-        return self.model.codec_embedding.weight.dtype
-
-    def get_input_embeddings(self):
-        return self.model.get_input_embeddings()
-
-    def get_text_embeddings(self):
-        return self.model.get_text_embeddings()
-
-    def load_speech_tokenizer(self, speech_tokenizer: Any) -> None:
-        self.speech_tokenizer = speech_tokenizer
-
-    def get_supported_languages(self):
-        return ["auto", *list(self.config.codec_language_id.keys())]
-
-    def get_supported_speakers(self):
-        return (getattr(self.config, "spk_id", None) or {}).keys()
-
-    @torch.inference_mode()
-    def extract_speaker_embedding(self, audio, sr):
-        apply_qwen_tts_transformers_compatibility_patches()
-        from qwen_tts.core.models.modeling_qwen3_tts import mel_spectrogram
-
-        if sr != self.speaker_encoder_sample_rate:
-            raise ValueError(
-                f"Expected {self.speaker_encoder_sample_rate}Hz reference audio"
-            )
-        if self.speaker_encoder is None:
-            raise RuntimeError("Qwen3-TTS speaker encoder is not loaded")
-        mels = mel_spectrogram(
-            torch.from_numpy(audio).unsqueeze(0),
-            n_fft=1024,
-            num_mels=128,
-            sampling_rate=self.speaker_encoder_sample_rate,
-            hop_size=256,
-            win_size=1024,
-            fmin=0,
-            fmax=12000,
-        ).transpose(1, 2)
-        return self.speaker_encoder(mels.to(self.device).to(self.dtype))[0]
-
-    @torch.inference_mode()
-    def generate_speaker_prompt(self, voice_clone_prompt: dict[str, Any]):
-        return [
-            emb.to(self.device).to(self.dtype)
-            for emb in voice_clone_prompt["ref_spk_embedding"]
-        ]
-
-    def _build_instruct_embed(
-        self,
-        instruct_id: torch.Tensor | None,
-    ) -> torch.Tensor | None:
-        if instruct_id is None:
-            return None
-        return self.text_projection(self.get_text_embeddings()(instruct_id))
-
-    def _build_tts_special_embeds(
-        self,
-        *,
-        dtype: torch.dtype,
-    ) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
-        ids = torch.tensor(
-            [
-                [
-                    self.root_config.tts_bos_token_id,
-                    self.root_config.tts_eos_token_id,
-                    self.root_config.tts_pad_token_id,
-                ]
-            ],
-            device=self.device,
-            dtype=dtype,
-        )
-        return self.text_projection(self.get_text_embeddings()(ids)).chunk(3, dim=1)
-
-    def _resolve_language_id(
-        self,
-        *,
-        language: str,
-        voice: str | None = None,
-    ) -> int | None:
-        if language.lower() != "auto":
-            return self.config.codec_language_id[language.lower()]
-        if voice is None:
-            return None
-        spk_is_dialect = getattr(self.config, "spk_is_dialect", None) or {}
-        dialect = spk_is_dialect.get(voice.lower())
-        if isinstance(dialect, str) and dialect:
-            return self.config.codec_language_id.get(dialect)
-        return None
-
-    def _build_codec_prefill(
-        self,
-        *,
-        language: str,
-        dtype: torch.dtype,
-        voice: str | None = None,
-    ) -> torch.Tensor:
-        language_id = self._resolve_language_id(language=language, voice=voice)
-        if language_id is None:
-            codec_prefill = [
-                self.config.codec_nothink_id,
-                self.config.codec_think_bos_id,
-                self.config.codec_think_eos_id,
-            ]
-        else:
-            codec_prefill = [
-                self.config.codec_think_id,
-                self.config.codec_think_bos_id,
-                language_id,
-                self.config.codec_think_eos_id,
-            ]
-        return self.get_input_embeddings()(
-            torch.tensor([codec_prefill], device=self.device, dtype=dtype)
-        )
-
-    def _finish_text_prompt(
-        self,
-        *,
-        talker_input_embed: torch.Tensor,
-        input_id: torch.Tensor,
-        codec_last_embed: torch.Tensor,
-        tts_pad_embed: torch.Tensor,
-        tts_eos_embed: torch.Tensor,
-        non_streaming_mode: bool,
-    ) -> tuple[torch.Tensor, torch.Tensor]:
-        if non_streaming_mode:
-            text_all = self.text_projection(
-                self.get_text_embeddings()(input_id[:, 3:-5])
-            )
-            text_all = torch.cat([text_all, tts_eos_embed], dim=1)
-            pad_ids = torch.full(
-                (1, int(text_all.shape[1])),
-                int(self.config.codec_pad_id),
-                device=self.device,
-                dtype=input_id.dtype,
-            )
-            talker_input_embed = torch.cat(
-                [
-                    talker_input_embed,
-                    text_all + self.get_input_embeddings()(pad_ids),
-                    tts_pad_embed
-                    + self.get_input_embeddings()(
-                        torch.tensor(
-                            [[self.config.codec_bos_id]],
-                            device=self.device,
-                            dtype=input_id.dtype,
-                        )
-                    ),
-                ],
-                dim=1,
-            )
-            return talker_input_embed, tts_pad_embed
-
-        first_text = (
-            self.text_projection(self.get_text_embeddings()(input_id[:, 3:4]))
-            + codec_last_embed
-        )
-        talker_input_embed = torch.cat([talker_input_embed, first_text], dim=1)
-        trailing_text_hidden = torch.cat(
-            [
-                self.text_projection(self.get_text_embeddings()(input_id[:, 4:-5])),
-                tts_eos_embed,
-            ],
-            dim=1,
-        )
-        return talker_input_embed, trailing_text_hidden
-
-    def _apply_instruct_prefix(
-        self,
-        talker_input_embed: torch.Tensor,
-        instruct_id: torch.Tensor | None,
-    ) -> torch.Tensor:
-        instruct_embed = self._build_instruct_embed(instruct_id)
-        if instruct_embed is None:
-            return talker_input_embed
-        return torch.cat([instruct_embed, talker_input_embed], dim=1)
-
-    def _build_conditioned_prompt_prefix(
-        self,
-        *,
-        input_id: torch.Tensor,
-        codec_input: torch.Tensor,
-        tts_bos_embed: torch.Tensor,
-        tts_pad_embed: torch.Tensor,
-    ) -> torch.Tensor:
-        role_embed = self.text_projection(self.get_text_embeddings()(input_id[:, :3]))
-        prompt_embed = (
-            torch.cat(
-                [tts_pad_embed.expand(-1, codec_input.shape[1] - 2, -1), tts_bos_embed],
-                dim=1,
-            )
-            + codec_input[:, :-1]
-        )
-        return torch.cat([role_embed, prompt_embed], dim=1)
-
-    def build_voice_clone_inputs(
-        self,
-        *,
-        input_id: torch.Tensor,
-        ref_id: torch.Tensor | None,
-        voice_clone_prompt: dict[str, Any],
-        language: str,
-        non_streaming_mode: bool,
-        instruct_id: torch.Tensor | None = None,
-    ) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor | None]:
-        voice_clone_spk_embeds = self.generate_speaker_prompt(voice_clone_prompt)
-        speaker_embed = voice_clone_spk_embeds[0]
-
-        tts_bos_embed, tts_eos_embed, tts_pad_embed = self._build_tts_special_embeds(
-            dtype=input_id.dtype
-        )
-        codec_input_0 = self._build_codec_prefill(
-            language=language,
-            dtype=input_id.dtype,
-        )
-        codec_input_1 = self.get_input_embeddings()(
-            torch.tensor(
-                [[self.config.codec_pad_id, self.config.codec_bos_id]],
-                device=self.device,
-                dtype=input_id.dtype,
-            )
-        )
-        codec_input = torch.cat(
-            [codec_input_0, speaker_embed.view(1, 1, -1), codec_input_1], dim=1
-        )
-        talker_input_embed = self._build_conditioned_prompt_prefix(
-            input_id=input_id,
-            codec_input=codec_input,
-            tts_bos_embed=tts_bos_embed,
-            tts_pad_embed=tts_pad_embed,
-        )
-
-        ref_code = None
-        ref_codes = voice_clone_prompt.get("ref_code")
-        if ref_codes is not None:
-            ref_code = ref_codes[0]
-
-        if ref_code is not None and voice_clone_prompt["icl_mode"][0]:
-            if ref_id is None:
-                raise ValueError("Qwen3-TTS ICL mode requires ref_text tokens")
-            icl_embed, trailing_text_hidden = self.generate_icl_prompt(
-                text_id=input_id[:, 3:-5],
-                ref_id=ref_id[:, 3:-2],
-                ref_code=ref_code.to(self.device),
-                tts_pad_embed=tts_pad_embed,
-                tts_eos_embed=tts_eos_embed,
-                non_streaming_mode=non_streaming_mode,
-            )
-            talker_input_embed = torch.cat([talker_input_embed, icl_embed], dim=1)
-        else:
-            talker_input_embed, trailing_text_hidden = self._finish_text_prompt(
-                talker_input_embed=talker_input_embed,
-                input_id=input_id,
-                codec_last_embed=codec_input[:, -1:],
-                tts_pad_embed=tts_pad_embed,
-                tts_eos_embed=tts_eos_embed,
-                non_streaming_mode=non_streaming_mode,
-            )
-
-        talker_input_embed = self._apply_instruct_prefix(
-            talker_input_embed,
-            instruct_id,
-        )
-        attention_mask = torch.ones(
-            (1, talker_input_embed.shape[1]), device=self.device, dtype=torch.long
-        )
-        return talker_input_embed, attention_mask, trailing_text_hidden, ref_code
-
-    def build_custom_voice_inputs(
-        self,
-        *,
-        input_id: torch.Tensor,
-        voice: str,
-        language: str,
-        non_streaming_mode: bool,
-        instruct_id: torch.Tensor | None = None,
-    ) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor, None]:
-        spk_id = getattr(self.config, "spk_id", None) or {}
-        if not spk_id:
-            raise ValueError(
-                "Qwen3-TTS CustomVoice requires a checkpoint with configured spk_id"
-            )
-        speaker_key = voice.lower()
-        spk_id_map = {str(key).lower(): value for key, value in spk_id.items()}
-        if speaker_key not in spk_id_map:
-            supported = ", ".join(sorted(str(key) for key in spk_id))
-            raise ValueError(
-                f"Unsupported Qwen3-TTS CustomVoice speaker {voice!r}. "
-                f"Supported speakers: {supported}"
-            )
-
-        tts_bos_embed, tts_eos_embed, tts_pad_embed = self._build_tts_special_embeds(
-            dtype=input_id.dtype
-        )
-        codec_input_0 = self._build_codec_prefill(
-            language=language,
-            dtype=input_id.dtype,
-            voice=speaker_key,
-        )
-        speaker_embed = self.get_input_embeddings()(
-            torch.tensor(
-                [spk_id_map[speaker_key]], device=self.device, dtype=input_id.dtype
-            )
-        ).view(1, 1, -1)
-        codec_input_1 = self.get_input_embeddings()(
-            torch.tensor(
-                [[self.config.codec_pad_id, self.config.codec_bos_id]],
-                device=self.device,
-                dtype=input_id.dtype,
-            )
-        )
-        codec_input = torch.cat([codec_input_0, speaker_embed, codec_input_1], dim=1)
-        talker_input_embed = self._build_conditioned_prompt_prefix(
-            input_id=input_id,
-            codec_input=codec_input,
-            tts_bos_embed=tts_bos_embed,
-            tts_pad_embed=tts_pad_embed,
-        )
-        talker_input_embed, trailing_text_hidden = self._finish_text_prompt(
-            talker_input_embed=talker_input_embed,
-            input_id=input_id,
-            codec_last_embed=codec_input[:, -1:],
-            tts_pad_embed=tts_pad_embed,
-            tts_eos_embed=tts_eos_embed,
-            non_streaming_mode=non_streaming_mode,
-        )
-        talker_input_embed = self._apply_instruct_prefix(
-            talker_input_embed,
-            instruct_id,
-        )
-        attention_mask = torch.ones(
-            (1, talker_input_embed.shape[1]), device=self.device, dtype=torch.long
-        )
-        return talker_input_embed, attention_mask, trailing_text_hidden, None
-
-    def build_voice_design_inputs(
-        self,
-        *,
-        input_id: torch.Tensor,
-        language: str,
-        non_streaming_mode: bool,
-        instruct_id: torch.Tensor | None,
-    ) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor, None]:
-        if instruct_id is None:
-            raise ValueError("Qwen3-TTS VoiceDesign requires instructions")
-
-        tts_bos_embed, tts_eos_embed, tts_pad_embed = self._build_tts_special_embeds(
-            dtype=input_id.dtype
-        )
-        codec_input_0 = self._build_codec_prefill(
-            language=language,
-            dtype=input_id.dtype,
-        )
-        codec_input_1 = self.get_input_embeddings()(
-            torch.tensor(
-                [[self.config.codec_pad_id, self.config.codec_bos_id]],
-                device=self.device,
-                dtype=input_id.dtype,
-            )
-        )
-        codec_input = torch.cat([codec_input_0, codec_input_1], dim=1)
-        talker_input_embed = self._build_conditioned_prompt_prefix(
-            input_id=input_id,
-            codec_input=codec_input,
-            tts_bos_embed=tts_bos_embed,
-            tts_pad_embed=tts_pad_embed,
-        )
-        talker_input_embed, trailing_text_hidden = self._finish_text_prompt(
-            talker_input_embed=talker_input_embed,
-            input_id=input_id,
-            codec_last_embed=codec_input[:, -1:],
-            tts_pad_embed=tts_pad_embed,
-            tts_eos_embed=tts_eos_embed,
-            non_streaming_mode=non_streaming_mode,
-        )
-        talker_input_embed = self._apply_instruct_prefix(
-            talker_input_embed,
-            instruct_id,
-        )
-        attention_mask = torch.ones(
-            (1, talker_input_embed.shape[1]), device=self.device, dtype=torch.long
-        )
-        return talker_input_embed, attention_mask, trailing_text_hidden, None
-
-    def generate_icl_prompt(
-        self,
-        text_id: torch.Tensor,
-        ref_id: torch.Tensor,
-        ref_code: torch.Tensor,
-        tts_pad_embed: torch.Tensor,
-        tts_eos_embed: torch.Tensor,
-        non_streaming_mode: bool,
-    ):
-        text_embed = self.text_projection(
-            self.get_text_embeddings()(torch.cat([ref_id, text_id], dim=-1))
-        )
-        text_embed = torch.cat([text_embed, tts_eos_embed], dim=1)
-        codec_embed = []
-        for idx in range(self.config.num_code_groups):
-            if idx == 0:
-                codec_embed.append(self.get_input_embeddings()(ref_code[:, :1]))
-            else:
-                codec_embed.append(
-                    self.code_predictor.model.codec_embedding[idx - 1](
-                        ref_code[:, idx : idx + 1]
-                    )
-                )
-        codec_embed = torch.cat(codec_embed, dim=1).sum(1).unsqueeze(0)
-        codec_embed = torch.cat(
-            [
-                self.get_input_embeddings()(
-                    torch.tensor(
-                        [[self.config.codec_bos_id]],
-                        device=self.device,
-                        dtype=text_id.dtype,
-                    )
-                ),
-                codec_embed,
-            ],
-            dim=1,
-        )
-        text_lens = text_embed.shape[1]
-        codec_lens = codec_embed.shape[1]
-        if non_streaming_mode:
-            icl_input_embed = text_embed + self.get_input_embeddings()(
-                torch.tensor(
-                    [[self.config.codec_pad_id] * text_lens],
-                    device=self.device,
-                    dtype=text_id.dtype,
-                )
-            )
-            icl_input_embed = torch.cat(
-                [icl_input_embed, codec_embed + tts_pad_embed], dim=1
-            )
-            return icl_input_embed, tts_pad_embed
-        if text_lens > codec_lens:
-            return text_embed[:, :codec_lens] + codec_embed, text_embed[:, codec_lens:]
-        text_embed = torch.cat(
-            [text_embed] + [tts_pad_embed] * (codec_lens - text_lens), dim=1
-        )
-        return text_embed + codec_embed, tts_pad_embed
 
     def prepare_decode_buffers(self, requests: list[Any]) -> None:
         batch_size = len(requests)
@@ -1044,40 +1090,29 @@ class Qwen3TTSTalker(nn.Module):
                 ) from exc
             semantic_seeds.append(semantic_seed)
             sub_do_samples.append(do_sample)
+            # note(ratish): the sampler divides by the temperature, staged clamped
+            # so the sub-steps read it without a kernel.
+            sub_temperatures.append(
+                max(subtalker_temperature, 1e-5) if do_sample else 1.0
+            )
+            sub_top_ps.append(subtalker_top_p if do_sample else 1.0)
             # Note (Shulei He): a greedy row's original top_k can be 0 or -1,
             # which would otherwise hit the full-sort branch.
-            sub_temperatures.append(subtalker_temperature if do_sample else 1.0)
-            sub_top_ps.append(subtalker_top_p if do_sample else 1.0)
             sub_top_ks.append(subtalker_top_k if do_sample else 1)
             sub_seeds.append(subtalker_seed)
             if do_sample:
                 sample_rows.append(row_idx)
 
         predictor_vocab_size = int(self.config.code_predictor_config.vocab_size)
-        sampled_top_ks = [sub_top_ks[row_idx] for row_idx in sample_rows]
-        bounded_top_ks = [
-            top_k for top_k in sampled_top_ks if 0 < int(top_k) < predictor_vocab_size
-        ]
-        self._sub_batch_size = batch_size
-        self._sub_sample_count = len(sample_rows)
-        self._sub_sample_max_row_index = sample_rows[-1] if sample_rows else -1
-        self._sub_has_sampled_rows = bool(sample_rows)
-        self._sub_sampled_has_top_p = any(
-            0.0 < float(sub_top_ps[row_idx]) < 1.0 for row_idx in sample_rows
+        max_top_k, has_top_p, has_unbounded_top_k = predictor_signature_terms(
+            [sub_top_ks[row_idx] for row_idx in sample_rows],
+            [sub_top_ps[row_idx] for row_idx in sample_rows],
+            predictor_vocab_size,
         )
-        has_unbounded_top_k = len(bounded_top_ks) != len(sampled_top_ks)
-        max_top_k = 0
-        max_bounded_top_k = max(bounded_top_ks, default=0)
-        if max_bounded_top_k > 0 and not has_unbounded_top_k:
-            # Note: (Jiaxin Deng) ladder-quantized so predictor-graph keys are
-            # shared across request top_k values; per-row masks keep true k.
-            quantized = _quantize_predictor_top_k(
-                max_bounded_top_k, predictor_vocab_size
-            )
-            if quantized is None:
-                has_unbounded_top_k = True
-            else:
-                max_top_k = quantized
+        self._sub_batch_size = batch_size
+        self._sub_has_sampled_rows = bool(sample_rows)
+        self._sub_has_argmax_rows = len(sample_rows) < batch_size
+        self._sub_sampled_has_top_p = has_top_p
         self._sub_sampled_max_top_k = max_top_k
         self._sub_sampled_has_unbounded_top_k = has_unbounded_top_k
 
@@ -1085,30 +1120,19 @@ class Qwen3TTSTalker(nn.Module):
             self._decode_prep_rids = rids
             return
 
-        device = self._sub_temperature_tensor.device
-        self._semantic_sampling_seed_tensor[:batch_size] = torch.tensor(
-            semantic_seeds,
-            device=device,
-            dtype=self._semantic_sampling_seed_tensor.dtype,
-        )
-        self._sub_temperature_tensor[:batch_size] = torch.tensor(
-            sub_temperatures, device=device, dtype=self._sub_temperature_tensor.dtype
-        )
-        self._sub_top_p_tensor[:batch_size] = torch.tensor(
-            sub_top_ps, device=device, dtype=self._sub_top_p_tensor.dtype
-        )
-        self._sub_top_k_tensor[:batch_size] = torch.tensor(
-            sub_top_ks, device=device, dtype=self._sub_top_k_tensor.dtype
-        )
-        self._sub_sampling_seed_tensor[:batch_size] = torch.tensor(
-            sub_seeds, device=device, dtype=self._sub_sampling_seed_tensor.dtype
-        )
-        self._sub_do_sample_tensor[:batch_size] = torch.tensor(
-            sub_do_samples, device=device, dtype=torch.bool
-        )
-        if sample_rows:
-            self._sub_sample_row_indices_tensor[: len(sample_rows)] = torch.tensor(
-                sample_rows, device=device, dtype=torch.long
+        # note(ratish): a pageable source waits for the last step's predictor.
+        pin_memory = is_pin_memory_available(self._sub_temperature_tensor.device)
+        for buffer, values in (
+            (self._semantic_sampling_seed_tensor, semantic_seeds),
+            (self._sub_temperature_tensor, sub_temperatures),
+            (self._sub_top_p_tensor, sub_top_ps),
+            (self._sub_top_k_tensor, sub_top_ks),
+            (self._sub_sampling_seed_tensor, sub_seeds),
+            (self._sub_do_sample_tensor, sub_do_samples),
+        ):
+            buffer[:batch_size].copy_(
+                torch.tensor(values, dtype=buffer.dtype, pin_memory=pin_memory),
+                non_blocking=True,
             )
         self._decode_prep_rids = rids
 
@@ -1133,7 +1157,7 @@ class Qwen3TTSTalker(nn.Module):
             input_embeds=input_embeds,
         )
         if forward_batch.forward_mode.is_extend():
-            last_index = self._extend_last_index(forward_batch, hidden_states.device)
+            last_index = self.extend_last_index(forward_batch, hidden_states.device)
             hidden_states = hidden_states[last_index]
         logits, _ = self.codec_head(hidden_states)
         logits_output = LogitsProcessorOutput(
@@ -1142,7 +1166,7 @@ class Qwen3TTSTalker(nn.Module):
         )
         return logits_output
 
-    def _extend_last_index(
+    def extend_last_index(
         self,
         forward_batch: ForwardBatch,
         device: torch.device,
@@ -1163,14 +1187,14 @@ class Qwen3TTSTalker(nn.Module):
             layer0_codes = layer0_codes.unsqueeze(1)
         if talker_hidden.ndim == 2:
             talker_hidden = talker_hidden.unsqueeze(1)
-        graph_result = self._predictor_forward_graphed(
+        graph_result = self.predictor_forward_graphed(
             layer0_codes,
             talker_hidden,
             semantic_positions,
         )
         if graph_result is not None:
             return graph_result
-        result_codes, summed_embeddings = self._code_predictor_forward_incremental(
+        result_codes, summed_embeddings = self.code_predictor_forward_incremental(
             layer0_codes=layer0_codes,
             talker_hidden=talker_hidden,
             semantic_positions=semantic_positions,
@@ -1178,7 +1202,7 @@ class Qwen3TTSTalker(nn.Module):
         return result_codes, summed_embeddings
 
     @staticmethod
-    def _normalize_predictor_graph_batch_sizes(
+    def normalize_predictor_graph_batch_sizes(
         server_args: object,
         *,
         max_batch_size: int,
@@ -1203,19 +1227,19 @@ class Qwen3TTSTalker(nn.Module):
             normalized.append(int(max_batch_size))
         return tuple(normalized)
 
-    def _predictor_graph_bucket_size(self, batch_size: int) -> int | None:
+    def predictor_graph_bucket_size(self, batch_size: int) -> int | None:
         for bucket_size in self._predictor_graph_batch_sizes:
             if bucket_size >= batch_size:
                 return bucket_size
         return None
 
-    def _predictor_graph_signature(
+    def predictor_graph_signature(
         self,
         batch_size: int,
         semantic_positions: torch.Tensor | None,
     ) -> tuple | None:
         if semantic_positions is not None:
-            if not semantic_positions.is_cuda:
+            if semantic_positions.device != self._predictor_device:
                 return None
             if (
                 semantic_positions.ndim not in (1, 2)
@@ -1225,7 +1249,7 @@ class Qwen3TTSTalker(nn.Module):
             if semantic_positions.ndim == 2 and semantic_positions.shape[1] != 1:
                 return None
         if not self._sub_has_sampled_rows:
-            return ("argmax", 0, False, False)
+            return ("argmax", 0, False, False, False)
         if semantic_positions is None:
             return None
         return (
@@ -1233,63 +1257,200 @@ class Qwen3TTSTalker(nn.Module):
             int(self._sub_sampled_max_top_k),
             bool(self._sub_sampled_has_top_p),
             bool(self._sub_sampled_has_unbounded_top_k),
+            bool(self._sub_has_argmax_rows),
         )
 
     @contextmanager
-    def _predictor_graph_capture_state(self, bucket_size: int, signature: tuple):
+    def predictor_graph_capture_state(self, bucket_size: int, signature: tuple):
         saved = (
             self._sub_batch_size,
-            self._sub_sample_count,
             self._sub_has_sampled_rows,
-            self._sub_sampled_has_top_p,
             self._sub_sampled_max_top_k,
+            self._sub_sampled_has_top_p,
             self._sub_sampled_has_unbounded_top_k,
+            self._sub_has_argmax_rows,
         )
-        sampled = signature[0] == "sampled"
         try:
             self._sub_batch_size = bucket_size
-            self._sub_has_sampled_rows = sampled
-            self._sub_sample_count = bucket_size if sampled else 0
-            _, max_top_k, has_top_p, has_unbounded_top_k = signature
-            self._sub_sampled_max_top_k = max_top_k
-            self._sub_sampled_has_top_p = has_top_p
-            self._sub_sampled_has_unbounded_top_k = has_unbounded_top_k
+            self._sub_has_sampled_rows = signature[0] == "sampled"
+            (
+                _,
+                self._sub_sampled_max_top_k,
+                self._sub_sampled_has_top_p,
+                self._sub_sampled_has_unbounded_top_k,
+                self._sub_has_argmax_rows,
+            ) = signature
             yield
         finally:
             (
                 self._sub_batch_size,
-                self._sub_sample_count,
                 self._sub_has_sampled_rows,
-                self._sub_sampled_has_top_p,
                 self._sub_sampled_max_top_k,
+                self._sub_sampled_has_top_p,
                 self._sub_sampled_has_unbounded_top_k,
+                self._sub_has_argmax_rows,
             ) = saved
 
-    def _predictor_graph_memory_pool(self):
+    def predictor_graph_memory_pool(self):
         # Note: (Jiaxin Deng) one shared pool across keys; private per-graph
         # pools would retain intermediates per key and scale with diversity.
         if self._predictor_graph_pool is None:
-            self._predictor_graph_pool = torch.cuda.graph_pool_handle()
+            self._predictor_graph_pool = (
+                self._predictor_device_module.graph_pool_handle()
+            )
         return self._predictor_graph_pool
 
-    def _resolve_predictor_graph_enabled(self) -> bool:
-        if not _predictor_graph_env_enabled():
-            return False
-        server_args = get_global_server_args()
-        if bool(server_args.disable_cuda_graph):
+    def resolve_predictor_graph_enabled(self) -> bool:
+        # Device first: a device that cannot record answers without published config.
+        if current_platform.get_device_graph_backend(self._predictor_device) is None:
             return False
         # Note: (Jiaxin Deng) capture under TP would record collectives; the
         # graphed chain is only validated single-rank, so TP stays eager.
-        return int(server_args.tp_size) == 1
+        if int(get_parallel().tp_size) != 1:
+            return False
+        override = predictor_graph_env_override()
+        if override is None:
+            should_capture = current_platform.enable_tts_predictor_graph()
+        else:
+            should_capture = override
+        if not should_capture:
+            return False
+        return not bool(get_exec().graph.disable_cuda_graph)
 
-    def _predictor_forward_graphed(
+    def capture_predictor_graphs(
+        self,
+        *,
+        do_sample: bool,
+        top_k: int,
+        top_p: float,
+    ) -> int:
+        """Capture the bucket ladder of the signatures a batch gets when its rows
+        sample with these values, with and without argmax rows mixed in. Buckets
+        go in descending order so the smaller ones reuse the pool of the larger
+        ones. The set is captured whole and the lazy capture budget counts only
+        keys beyond it. The mixed signature skips bucket 1: a mixed batch holds
+        a sampled row and an argmax row."""
+        if self._predictor_graph_enabled is None:
+            self._predictor_graph_enabled = self.resolve_predictor_graph_enabled()
+        if not self._predictor_graph_enabled:
+            return 0
+        if do_sample:
+            max_top_k, has_top_p, has_unbounded_top_k = predictor_signature_terms(
+                [int(top_k)],
+                [float(top_p)],
+                int(self.config.code_predictor_config.vocab_size),
+            )
+            signatures = [
+                ("sampled", max_top_k, has_top_p, has_unbounded_top_k, has_argmax_rows)
+                for has_argmax_rows in (False, True)
+            ]
+        else:
+            signatures = [("argmax", 0, False, False, False)]
+        started = time.perf_counter()
+        captured_before = len(self._predictor_graphs)
+        for signature in signatures:
+            for bucket_size in reversed(self._predictor_graph_batch_sizes):
+                if signature[4] and bucket_size < 2:
+                    continue
+                key = (bucket_size, *signature)
+                if key in self._predictor_graphs:
+                    continue
+                self._predictor_graphs[key] = self.capture_predictor_graph(
+                    bucket_size, signature
+                )
+                self._predictor_graph_capture_count += 1
+                self._predictor_graph_startup_count += 1
+        captured = len(self._predictor_graphs) - captured_before
+        elapsed_s = time.perf_counter() - started
+        logger.info(
+            f"Captured {captured} Qwen3-TTS predictor graphs for "
+            f"signatures={signatures} in {elapsed_s:.1f} s"
+        )
+        return captured
+
+    @torch.no_grad()
+    def capture_predictor_graph(
+        self,
+        bucket_size: int,
+        signature: tuple,
+    ) -> PredictorDecodeGraph:
+        """One stream per talker for warmups and captures: the allocator only
+        reuses a pool block on the stream that freed it. Automatic collection
+        is off for the capture because a graph finalizer reached by the
+        cyclic collector while a stream is capturing destroys its pool inside
+        the capture."""
+        device = self._predictor_device
+        module = self._predictor_device_module
+        backend = current_platform.get_device_graph_backend(device)
+        if self._predictor_capture_stream is None:
+            self._predictor_capture_stream = module.Stream(device=device)
+        capture_stream = self._predictor_capture_stream
+        current_stream = module.current_stream(device)
+        graph = PredictorDecodeGraph(
+            bucket_size,
+            signature,
+            device=device,
+            hidden_size=int(self._output_embeds.shape[-1]),
+            hidden_dtype=self._output_embeds.dtype,
+        )
+        # note(ratish): the buffers are zero filled on the current stream and
+        # layer0_codes is an embedding index, so the capture stream waits here.
+        capture_stream.wait_stream(current_stream)
+
+        def run_once() -> Tuple[torch.Tensor, torch.Tensor]:
+            return self.code_predictor_forward_incremental(
+                graph.layer0_codes,
+                graph.talker_hidden,
+                semantic_positions=graph.semantic_positions,
+            )
+
+        gc_was_enabled = gc.isenabled()
+        gc.disable()
+        captured = None
+        try:
+            # note(ratish): the outer stream context restores the current stream
+            # when a failed capture raises from capture_end before the graph
+            # context restores it.
+            with (
+                module.device(device),
+                current_platform.graph_capture_attention(),
+                self.predictor_graph_capture_state(bucket_size, signature),
+                module.stream(capture_stream),
+            ):
+                for _ in range(_PREDICTOR_GRAPH_WARMUP_PASSES):
+                    run_once()
+                with backend.capture(
+                    pool=self.predictor_graph_memory_pool(),
+                    stream=capture_stream,
+                    thread_local_errors=True,
+                ) as captured:
+                    graph.result_codes, graph.summed_embeddings = run_once()
+        except Exception:
+            # Note: (Jiaxin Deng) release the graph's private memory pool
+            # eagerly; the raising object may linger on traceback frames.
+            if captured is not None:
+                try:
+                    captured.reset()
+                except Exception:
+                    pass
+            raise
+        finally:
+            current_stream.wait_stream(capture_stream)
+            if gc_was_enabled:
+                gc.enable()
+        graph.graph = captured
+        if graph.result_codes is None or graph.summed_embeddings is None:
+            raise RuntimeError("Qwen3-TTS predictor graph captured no outputs")
+        return graph
+
+    def predictor_forward_graphed(
         self,
         layer0_codes: torch.Tensor,
         talker_hidden: torch.Tensor,
         semantic_positions: torch.Tensor | None,
     ) -> Tuple[torch.Tensor, torch.Tensor] | None:
         if self._predictor_graph_enabled is None:
-            self._predictor_graph_enabled = self._resolve_predictor_graph_enabled()
+            self._predictor_graph_enabled = self.resolve_predictor_graph_enabled()
         if not self._predictor_graph_enabled:
             return None
         batch_size, seq_len = layer0_codes.shape
@@ -1297,16 +1458,17 @@ class Qwen3TTSTalker(nn.Module):
             return None
         if layer0_codes.dtype not in (torch.int, torch.long):
             return None
-        if not layer0_codes.is_cuda or not talker_hidden.is_cuda:
+        graph_device = self._predictor_device
+        if layer0_codes.device != graph_device or talker_hidden.device != graph_device:
             return None
         if batch_size != self._sub_batch_size:
             return None
-        if torch.cuda.is_current_stream_capturing():
+        if self._predictor_device_module.is_current_stream_capturing():
             return None
-        signature = self._predictor_graph_signature(batch_size, semantic_positions)
+        signature = self.predictor_graph_signature(batch_size, semantic_positions)
         if signature is None:
             return None
-        bucket_size = self._predictor_graph_bucket_size(batch_size)
+        bucket_size = self.predictor_graph_bucket_size(batch_size)
         if bucket_size is None:
             return None
         key = (bucket_size, *signature)
@@ -1314,54 +1476,50 @@ class Qwen3TTSTalker(nn.Module):
             return None
         graph = self._predictor_graphs.get(key)
         if graph is None:
-            if len(self._predictor_graphs) >= _PREDICTOR_GRAPH_MAX_KEYS:
+            lazy_keys = (
+                len(self._predictor_graphs) - self._predictor_graph_startup_count
+            )
+            if lazy_keys >= _PREDICTOR_GRAPH_MAX_LAZY_KEYS:
                 self._predictor_graph_capacity_fallback_count += 1
                 if not self._predictor_graph_capacity_warned:
                     self._predictor_graph_capacity_warned = True
                     logger.warning(
-                        "Qwen3-TTS predictor CUDA graph cache reached %d keys; "
-                        "falling back to eager execution for uncached key=%s",
-                        _PREDICTOR_GRAPH_MAX_KEYS,
+                        "Qwen3-TTS predictor graph cache holds %d keys beyond "
+                        "the startup set; falling back to eager execution for "
+                        "uncached key=%s",
+                        lazy_keys,
                         key,
                     )
                 return None
             try:
-                graph = _PredictorDecodeGraph(
-                    self,
-                    bucket_size,
-                    signature,
-                    hidden_size=int(talker_hidden.shape[-1]),
-                    hidden_dtype=talker_hidden.dtype,
-                )
+                graph = self.capture_predictor_graph(bucket_size, signature)
             except Exception:
                 self._predictor_graph_disabled.add(key)
                 self._predictor_graph_failure_count += 1
                 logger.warning(
-                    "Disabling Qwen3-TTS predictor CUDA graph for key=%s",
+                    "Disabling Qwen3-TTS predictor graph for key=%s",
                     key,
                     exc_info=True,
                 )
                 if self._predictor_graph_failure_count >= _PREDICTOR_GRAPH_MAX_FAILURES:
                     self._predictor_graph_enabled = False
                     logger.warning(
-                        "Disabling Qwen3-TTS predictor CUDA graphs entirely "
+                        "Disabling Qwen3-TTS predictor graphs entirely "
                         "after %d capture failures",
                         self._predictor_graph_failure_count,
                     )
                 return None
             self._predictor_graphs[key] = graph
             self._predictor_graph_capture_count += 1
-            logger.info("Captured Qwen3-TTS predictor CUDA graph for key=%s", key)
+            logger.info("Captured Qwen3-TTS predictor graph for key=%s", key)
         result = graph.replay(layer0_codes, talker_hidden, semantic_positions)
         return result
 
-    def _code_predictor_forward_incremental(
+    def code_predictor_forward_incremental(
         self,
         layer0_codes: torch.Tensor,
         talker_hidden: torch.Tensor,
         semantic_positions: torch.Tensor | None = None,
-        *,
-        for_capture: bool = False,
     ) -> Tuple[torch.Tensor, torch.Tensor]:
         if layer0_codes.ndim == 1:
             layer0_codes = layer0_codes.unsqueeze(1)
@@ -1369,7 +1527,7 @@ class Qwen3TTSTalker(nn.Module):
             talker_hidden = talker_hidden.unsqueeze(1)
 
         batch_size, seq_len = layer0_codes.shape
-        semantic_positions = self._normalize_semantic_positions(
+        semantic_positions = self.normalize_semantic_positions(
             semantic_positions,
             batch_size=batch_size,
             seq_len=seq_len,
@@ -1384,13 +1542,7 @@ class Qwen3TTSTalker(nn.Module):
         embedding_buffer = getattr(self, "_predictor_embedding_buffer", None)
         if embedding_buffer is not None:
             embedding_buffer = embedding_buffer[:batch_size]
-        # Note (Jun Liu): Capture P2 into a graph; a standalone Triton launch
-        # loses to ATen.
-        use_fused_embedding = (
-            embedding_buffer is not None
-            and layer0_codes.is_cuda
-            and torch.cuda.is_current_stream_capturing()
-        )
+        use_fused_embedding = embedding_buffer is not None and layer0_codes.is_cuda
 
         for pos in range(seq_len):
             layer0_code = layer0_codes[:, pos : pos + 1]
@@ -1401,33 +1553,43 @@ class Qwen3TTSTalker(nn.Module):
             pos_codes = result_codes[:, :, pos]
             pos_summed = summed_embeddings[:, pos, :]
             pos_summed.zero_()
-            talker_predictor_embed = self.code_predictor.project_input(
-                talker_hidden[:, pos : pos + 1, :]
-            ).to(dtype=predictor_dtype)
+            talker_slice = talker_hidden[:, pos : pos + 1, :]
+            talker_predictor_embed = self.code_predictor.project_input(talker_slice).to(
+                dtype=predictor_dtype
+            )
+            if talker_predictor_embed is talker_slice:
+                # note(ratish): the fused o_proj epilogue overwrites its residual,
+                # which on the first layer is this tensor.
+                talker_predictor_embed = talker_slice.clone()
             pos_codes[:, 0].copy_(layer0_code[:, 0])
             pos_summed.add_(layer0_embed[:, 0, :])
 
             cache_len = 0
-            self._predictor_forward_one_token(
+            self.predictor_forward_one_token(
                 token_embeds=talker_predictor_embed,
                 batch_size=batch_size,
                 cache_len=cache_len,
             )
             cache_len += 1
-            last_hidden = self._predictor_forward_one_token(
+            last_hidden = self.predictor_forward_one_token(
                 token_embeds=layer0_predictor_embed,
                 batch_size=batch_size,
                 cache_len=cache_len,
             )
             cache_len += 1
 
+            sub_positions = (
+                self.sub_seed_positions(semantic_positions[:, pos])
+                if self._sub_has_sampled_rows
+                else None
+            )
             for layer_idx in range(num_groups - 1):
                 logits, _ = self.code_predictor.lm_head[layer_idx](last_hidden)
-                next_code = self._sample_subtalker_token(
+                next_code = self.sample_subtalker_token(
                     logits[:, -1, :],
-                    layer_idx,
-                    semantic_positions=semantic_positions[:, pos],
-                    for_capture=for_capture,
+                    sub_positions=(
+                        None if sub_positions is None else sub_positions[layer_idx]
+                    ),
                 )
                 pos_codes[:, layer_idx + 1].copy_(next_code)
                 codec_embedding = self.code_predictor.model.codec_embedding[layer_idx]
@@ -1450,7 +1612,7 @@ class Qwen3TTSTalker(nn.Module):
                     pos_summed.add_(new_embed[:, 0, :])
                 new_predictor_embed = self.code_predictor.project_input(new_embed)
                 if layer_idx < num_groups - 2:
-                    last_hidden = self._predictor_forward_one_token(
+                    last_hidden = self.predictor_forward_one_token(
                         token_embeds=new_predictor_embed,
                         batch_size=batch_size,
                         cache_len=cache_len,
@@ -1458,7 +1620,7 @@ class Qwen3TTSTalker(nn.Module):
                     cache_len += 1
         return result_codes, summed_embeddings
 
-    def _normalize_semantic_positions(
+    def normalize_semantic_positions(
         self,
         semantic_positions: torch.Tensor | None,
         *,
@@ -1479,61 +1641,21 @@ class Qwen3TTSTalker(nn.Module):
         offsets = torch.arange(seq_len, device=device, dtype=torch.long)
         return base.unsqueeze(1) + offsets.unsqueeze(0)
 
-    def _sample_subtalker_token(
-        self,
-        logits: torch.Tensor,
-        layer_idx: int = 0,
-        *,
-        semantic_positions: torch.Tensor | None = None,
-        for_capture: bool = False,
-    ) -> torch.Tensor:
-        if for_capture:
-            return self._sample_subtalker_token_graph_safe(
-                logits, layer_idx, semantic_positions=semantic_positions
-            )
-
-        if logits.shape[0] == 0:
-            return torch.empty((0,), device=logits.device, dtype=torch.long)
-        batch_size = int(logits.shape[0])
-        if batch_size > self._sub_batch_size:
-            raise RuntimeError("Qwen3-TTS subtalker sampling buffers are too small")
-
-        if not self._sub_has_sampled_rows:
-            return torch.argmax(logits, dim=-1).to(dtype=torch.long)
-
-        if self._sub_sample_max_row_index >= batch_size:
-            raise RuntimeError("Qwen3-TTS sampled row index exceeds batch size")
-        sampled_rows = self._sub_sample_row_indices_tensor[: self._sub_sample_count]
-        sampled_positions = self._select_semantic_positions(
-            semantic_positions,
-            batch_size,
-            logits.device,
-        ).index_select(0, sampled_rows)
-
-        if self._sub_sample_count == batch_size:
-            return self._sample_subtalker_token_seeded(
-                logits,
-                layer_idx,
-                row_indices=sampled_rows,
-                semantic_positions=sampled_positions,
-            )
-
-        tokens = torch.argmax(logits, dim=-1).to(dtype=torch.long)
-        sampled_logits = logits.index_select(0, sampled_rows)
-        tokens[sampled_rows] = self._sample_subtalker_token_seeded(
-            sampled_logits,
-            layer_idx,
-            row_indices=sampled_rows,
-            semantic_positions=sampled_positions,
+    def sub_seed_positions(self, semantic_positions: torch.Tensor) -> torch.Tensor:
+        """Seed positions of every sub-step of one decode position, sub-step
+        first, so each sub-step reads its row without a kernel."""
+        group_stride = max(int(self.config.num_code_groups) - 1, 1)
+        return torch.add(
+            self._sub_seed_offsets.unsqueeze(1),
+            semantic_positions.unsqueeze(0),
+            alpha=group_stride,
         )
-        return tokens
 
-    def _sample_subtalker_token_graph_safe(
+    def sample_subtalker_token(
         self,
         logits: torch.Tensor,
-        layer_idx: int = 0,
         *,
-        semantic_positions: torch.Tensor | None = None,
+        sub_positions: torch.Tensor | None,
     ) -> torch.Tensor:
         if logits.shape[0] == 0:
             return torch.empty((0,), device=logits.device, dtype=torch.long)
@@ -1544,18 +1666,12 @@ class Qwen3TTSTalker(nn.Module):
         if not self._sub_has_sampled_rows:
             return torch.argmax(logits, dim=-1).to(dtype=torch.long)
 
-        row_indices = self._sub_identity_row_indices_tensor[:batch_size]
-        batch_positions = self._select_semantic_positions(
-            semantic_positions,
-            batch_size,
-            logits.device,
-        )
-        sampled_tokens = self._sample_subtalker_token_seeded(
+        sampled_tokens = self.sample_subtalker_token_seeded(
             logits,
-            layer_idx,
-            row_indices=row_indices,
-            semantic_positions=batch_positions,
+            sub_positions=sub_positions,
         )
+        if not self._sub_has_argmax_rows:
+            return sampled_tokens
         argmax_tokens = torch.argmax(logits, dim=-1).to(dtype=torch.long)
         return torch.where(
             self._sub_do_sample_tensor[:batch_size],
@@ -1563,49 +1679,22 @@ class Qwen3TTSTalker(nn.Module):
             argmax_tokens,
         )
 
-    def _select_semantic_positions(
-        self,
-        semantic_positions: torch.Tensor | None,
-        batch_size: int,
-        device: torch.device,
-    ) -> torch.Tensor:
-        if semantic_positions is None:
-            raise RuntimeError("Qwen3-TTS sampled subtalker rows require positions")
-        semantic_positions = semantic_positions.to(device=device, dtype=torch.long)
-        if semantic_positions.ndim != 1 or semantic_positions.shape[0] != batch_size:
-            raise ValueError("Qwen3-TTS subtalker positions shape mismatch")
-        return semantic_positions
-
-    def _sample_subtalker_token_seeded(
+    def sample_subtalker_token_seeded(
         self,
         logits: torch.Tensor,
-        layer_idx: int,
         *,
-        row_indices: torch.Tensor,
-        semantic_positions: torch.Tensor,
+        sub_positions: torch.Tensor,
     ) -> torch.Tensor:
-        row_indices = row_indices.to(device=logits.device, dtype=torch.long)
-        temperatures = self._sub_temperature_tensor.index_select(
-            0, row_indices
-        ).clamp_min(1e-5)
-
+        batch_size = int(logits.shape[0])
         vocab_size = int(logits.shape[-1])
-        top_ks = self._sub_top_k_tensor.index_select(0, row_indices)
+        temperatures = self._sub_temperature_tensor[:batch_size]
+        top_ks = self._sub_top_k_tensor[:batch_size]
+        top_ps = self._sub_top_p_tensor[:batch_size]
+        seeds = self._sub_sampling_seed_tensor[:batch_size]
         max_top_k = int(self._sub_sampled_max_top_k)
         has_unbounded_top_k = bool(self._sub_sampled_has_unbounded_top_k)
-        top_ps = self._sub_top_p_tensor.index_select(0, row_indices)
-        seeds = self._sub_sampling_seed_tensor.index_select(0, row_indices)
-        sub_positions = (
-            semantic_positions.to(device=logits.device, dtype=torch.long)
-            * max(int(self.config.num_code_groups) - 1, 1)
-            + int(layer_idx)
-            + 1
-        )
 
-        # Note (Jun Liu): The raw-logit fusion has a favorable launch-count
-        # tradeoff only in the predictor CUDA graph. The eager path keeps the
-        # mature ATen sequence, including all of its shape coverage.
-        if logits.is_cuda and torch.cuda.is_current_stream_capturing():
+        if logits.is_cuda:
             fused_sampled = sample_from_logits_with_seed_top_k_top_p(
                 logits,
                 temperatures,
@@ -1657,53 +1746,56 @@ class Qwen3TTSTalker(nn.Module):
         if sampled is not None:
             return sampled.to(torch.long)
 
-        sampled_rank = _sample_seeded_categorical(
+        sampled_rank = sample_seeded_categorical(
             sorted_logprobs,
             seeds,
             sub_positions,
         ).to(device=logits.device, dtype=torch.long)
         return sorted_idx.gather(1, sampled_rank.unsqueeze(1)).view(-1).to(torch.long)
 
-    def _predictor_forward_one_token(
+    def predictor_forward_one_token(
         self,
         *,
         token_embeds: torch.Tensor,
         batch_size: int,
         cache_len: int,
     ) -> torch.Tensor:
-        hidden_states = token_embeds
-        hidden_size = hidden_states.shape[-1]
+        hidden_size = token_embeds.shape[-1]
         positions = self._predictor_position_rows[cache_len, :batch_size]
+        # note(ratish): 2D rows for the fused add and norm, which every
+        # backend's kernel expects and which writes both operands in place.
+        residual = token_embeds
+        mlp_out: torch.Tensor | None = None
         for layer_idx, layer in enumerate(self.code_predictor.model.layers):
-            residual = hidden_states
-            normed = layer.input_layernorm(hidden_states.reshape(-1, hidden_size))
-            normed = normed.reshape(batch_size, 1, hidden_size)
-            attn_input = self._predictor_cached_self_attention(
+            if mlp_out is None:
+                normed = layer.input_layernorm(residual.reshape(-1, hidden_size))
+            else:
+                normed, residual = layer.input_layernorm(
+                    mlp_out, residual.reshape(-1, hidden_size)
+                )
+                residual = residual.reshape(batch_size, 1, hidden_size)
+            attn_input = self.predictor_cached_self_attention(
                 layer_idx=layer_idx,
                 attn=layer.self_attn,
-                hidden_states=normed,
+                hidden_states=normed.reshape(batch_size, 1, hidden_size),
                 positions=positions,
                 batch_size=batch_size,
                 cache_len=cache_len,
             )
-            hidden_states = self._predictor_o_proj_add_residual(
+            residual = self.predictor_o_proj_add_residual(
                 layer.self_attn.o_proj,
                 attn_input,
                 residual,
             )
-            residual = hidden_states
-            normed = layer.post_attention_layernorm(
-                hidden_states.reshape(-1, hidden_size)
-            )
-            mlp_out = layer.mlp(normed).reshape(batch_size, 1, hidden_size)
-            hidden_states = residual + mlp_out
-        hidden_states = self.code_predictor.model.norm(
-            hidden_states.reshape(-1, hidden_size)
+            normed = layer.post_attention_layernorm(residual.reshape(-1, hidden_size))
+            mlp_out = layer.mlp(normed)
+        normed, _ = self.code_predictor.model.norm(
+            mlp_out, residual.reshape(-1, hidden_size)
         )
-        return hidden_states.reshape(batch_size, 1, hidden_size)
+        return normed.reshape(batch_size, 1, hidden_size)
 
     @staticmethod
-    def _predictor_o_proj_add_residual(
+    def predictor_o_proj_add_residual(
         o_proj: nn.Module,
         attn_input: torch.Tensor,
         residual: torch.Tensor,
@@ -1711,11 +1803,14 @@ class Qwen3TTSTalker(nn.Module):
         """Run the Predictor attention output projection and residual add."""
 
         weight = getattr(o_proj, "weight", None)
+        # note(ratish): the fusion stands in for sglang's linear only where that
+        # linear is torch's GEMM: batch invariant mode overrides aten::addmm but
+        # not the out variant, and the cutedsl backend replaces F.linear on sm100.
         use_fused_addmm = (
             attn_input.is_cuda
-            and torch.cuda.is_current_stream_capturing()
+            and not is_batch_invariant_mode_enabled()
+            and not get_bf16_gemm_backend().is_cutedsl()
             and not torch.is_grad_enabled()
-            and torch.cuda.get_device_capability(attn_input.device) == (9, 0)
             and isinstance(
                 getattr(o_proj, "quant_method", None), UnquantizedLinearMethod
             )
@@ -1755,7 +1850,19 @@ class Qwen3TTSTalker(nn.Module):
             attn_input.shape[0], 1, residual.shape[-1]
         )
 
-    def _predictor_cached_self_attention(
+    @staticmethod
+    def resolve_predictor_rope_store(attn: Any, *, device: torch.device) -> bool:
+        """Resolve store support before capture: a supported CUDA head size
+        does not imply CUDA dispatch when the backend override selects Torch."""
+        return (
+            device.type == "cuda"
+            and attn.compatible_with_fused_kv_buffer
+            and not attn.rotary_emb.use_fallback_kernel
+            and get_fused_op_backend()
+            not in (KernelBackend.TORCH, KernelBackend.TORCH_COMPILE)
+        )
+
+    def predictor_cached_self_attention(
         self,
         *,
         layer_idx: int,
@@ -1781,38 +1888,42 @@ class Qwen3TTSTalker(nn.Module):
             head_dim=attn.head_dim,
             alt_stream=attn.alt_stream,
         )
+        if self._predictor_rope_stores_kv:
+            store = FusedSetKVBufferArg(
+                value=v,
+                k_buffer=self._predictor_k_rows[layer_idx],
+                v_buffer=self._predictor_v_rows[layer_idx],
+                cache_loc=self._predictor_cache_slots[cache_len, :batch_size],
+            )
+        else:
+            store = None
         q, k = attn.rotary_emb(
             positions.to(device=flat_hidden.device, dtype=torch.long),
             q,
             k,
-            fused_set_kv_buffer_arg=None,
+            fused_set_kv_buffer_arg=store,
         )
+        if store is None:
+            self._predictor_k_cache[layer_idx, :batch_size, cache_len].copy_(
+                k.view(batch_size, attn.num_kv_heads, attn.head_dim)
+            )
+            self._predictor_v_cache[layer_idx, :batch_size, cache_len].copy_(
+                v.view(batch_size, attn.num_kv_heads, attn.head_dim)
+            )
         q = q.reshape(batch_size, 1, attn.num_heads, attn.head_dim).transpose(1, 2)
-        k = k.reshape(batch_size, 1, attn.num_kv_heads, attn.head_dim).transpose(1, 2)
-        v = v.reshape(batch_size, 1, attn.num_kv_heads, attn.head_dim).transpose(1, 2)
-
-        layer_k_cache = self._predictor_k_cache[layer_idx, :batch_size]
-        layer_v_cache = self._predictor_v_cache[layer_idx, :batch_size]
-        layer_k_cache[:, :, cache_len : cache_len + 1, :].copy_(k)
-        layer_v_cache[:, :, cache_len : cache_len + 1, :].copy_(v)
-        cached_k = layer_k_cache[:, :, : cache_len + 1, :]
-        cached_v = layer_v_cache[:, :, : cache_len + 1, :]
-        num_kv_groups = attn.num_heads // attn.num_kv_heads
-        if num_kv_groups == 1:
-            attn_output = torch.nn.functional.scaled_dot_product_attention(
-                q,
-                cached_k,
-                cached_v,
-                is_causal=False,
-            )
-        else:
-            attn_output = torch.nn.functional.scaled_dot_product_attention(
-                q,
-                cached_k,
-                cached_v,
-                is_causal=False,
-                enable_gqa=True,
-            )
+        cached_k = self._predictor_k_cache[
+            layer_idx, :batch_size, : cache_len + 1
+        ].transpose(1, 2)
+        cached_v = self._predictor_v_cache[
+            layer_idx, :batch_size, : cache_len + 1
+        ].transpose(1, 2)
+        attn_output = predictor_gqa_attention(
+            q,
+            cached_k,
+            cached_v,
+            num_heads=attn.num_heads,
+            num_key_value_heads=attn.num_kv_heads,
+        )
         attn_output = attn_output.transpose(1, 2).reshape(
             batch_size, attn.num_heads * attn.head_dim
         )

@@ -87,6 +87,37 @@ def _voice_routing(
     )
 
 
+@pytest.mark.asyncio
+async def test_worker_builtin_voice_list_does_not_populate_uploaded_registry(
+    tmp_path, monkeypatch
+) -> None:
+    from sglang_omni.config import CustomVoiceConfig
+    from sglang_omni.serve import create_app as create_worker_app
+
+    monkeypatch.setenv("SPEAKER_SAMPLES_DIR", str(tmp_path))
+    app = create_worker_app(
+        object(),
+        custom_voice_config=CustomVoiceConfig(
+            speakers=("Ryan",), task_type="CustomVoice"
+        ),
+    )
+    config = _router_config(voice_owner_worker_url="http://worker-a:8101")
+    workers = build_workers(config.workers)
+    workers[0].state = "healthy"
+    async with httpx.AsyncClient(
+        transport=httpx.ASGITransport(app=app), base_url=workers[0].url
+    ) as client:
+        listed = await client.get("/v1/audio/voices")
+        assert listed.json()["voices"] == ["default", "Ryan"]
+        state = _voice_routing(config, workers, client)
+        assert state.ensure_owner() is workers[0]
+        assert state.requires_owner({"Ryan"})
+        await state.reconcile_once()
+        assert state.to_dict()["registry_state"] == "ready"
+        assert state.to_dict()["uploaded_voice_count"] == 0
+        assert not state.requires_owner({"Ryan"})
+
+
 def test_voice_owner_config_must_identify_a_capable_worker() -> None:
     with pytest.raises(
         ValueError,
@@ -1352,7 +1383,7 @@ async def test_tts_websocket_rejects_oversized_followup_before_upstream_send() -
             await asyncio.Event().wait()
 
     upstream = WaitingUpstream([])
-    outcome = await websocket_proxy_module._relay(
+    outcome = await websocket_proxy_module.relay(
         OversizedClient(),
         upstream,
         max_client_message_bytes=4,
@@ -1385,7 +1416,7 @@ async def test_tts_websocket_relay_propagates_simultaneous_secondary_failure() -
     assert upstream_task.done()
 
     with pytest.raises(AssertionError, match="simultaneous relay defect"):
-        await websocket_proxy_module._coordinate_relay(
+        await websocket_proxy_module.coordinate_relay(
             ConnectedWebSocket(),
             Upstream(),
             client_task=client_task,

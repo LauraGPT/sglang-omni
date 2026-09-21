@@ -57,9 +57,15 @@ _AUDIO_START = "<|audio_start|>"
 _AUDIO_PAD = "<|audio_pad|>"
 _AUDIO_END = "<|audio_end|>"
 _ASR_TEXT = "<asr_text>"
-# Qwen3-ASR's checkpoint chat template emits this empty system turn even
-# when no caller-provided system context is present.
+# Note(Audrey): the checkpoint's chat template emits this system turn even when
+# empty; caller biasing text goes inside it.
 _SYSTEM_PROMPT = "<|im_start|>system\n<|im_end|>\n"
+
+
+def system_turn(context: str | None) -> str:
+    if not context:
+        return _SYSTEM_PROMPT
+    return f"<|im_start|>system\n{context}<|im_end|>\n"
 
 
 @dataclass
@@ -70,9 +76,10 @@ class Qwen3ASRRequestData(SGLangARRequestData):
     audio_duration_s: float = 0.0
     language: str | None = None
     engine_start_s: float = 0.0
+    streaming_prefix_text: str = ""
 
 
-def _decode_token_ids(
+def decode_token_ids(
     tokenizer: Any, token_ids: list[int], skip_special_tokens: bool
 ) -> str:
     try:
@@ -85,7 +92,7 @@ def _decode_token_ids(
         return tokenizer.decode(token_ids, skip_special_tokens=skip_special_tokens)
 
 
-def _find_subsequence(values: list[int], pattern: list[int]) -> int | None:
+def find_subsequence(values: list[int], pattern: list[int]) -> int | None:
     if not pattern:
         return None
     limit = len(values) - len(pattern) + 1
@@ -95,7 +102,7 @@ def _find_subsequence(values: list[int], pattern: list[int]) -> int | None:
     return None
 
 
-def _encode_literal(tokenizer: Any, text: str) -> list[int]:
+def encode_literal(tokenizer: Any, text: str) -> list[int]:
     if hasattr(tokenizer, "encode"):
         return list(tokenizer.encode(text, add_special_tokens=False))
     encoded = tokenizer(text, add_special_tokens=False)
@@ -104,6 +111,25 @@ def _encode_literal(tokenizer: Any, text: str) -> list[int]:
     else:
         input_ids = encoded["input_ids"]
     return list(input_ids)
+
+
+def retained_streaming_prefix(
+    tokenizer: Any, text: str, rollback_tokens: int
+) -> tuple[list[int], str]:
+    token_ids = encode_literal(tokenizer, text)
+    retained = token_ids[: max(len(token_ids) - rollback_tokens, 0)]
+    while retained:
+        decoded = decode_token_ids(tokenizer, retained, skip_special_tokens=False)
+        try:
+            decoded.encode("utf-8")
+        except UnicodeEncodeError:
+            retained.pop()
+            continue
+        if decoded.endswith("\ufffd"):
+            retained.pop()
+            continue
+        return retained, decoded
+    return [], ""
 
 
 def make_qwen3_asr_scheduler_adapters(
@@ -128,11 +154,13 @@ def make_qwen3_asr_scheduler_adapters(
     # tokenizer.vocab_size. Req uses this bound to reject invalid model outputs,
     # so include the added tokens.
     vocab_size = len(tokenizer)
-    asr_text_token_ids = _encode_literal(tokenizer, _ASR_TEXT)
+    asr_text_token_ids = encode_literal(tokenizer, _ASR_TEXT)
 
     @lru_cache(maxsize=None)
-    def _prompt_parts(language: str | None) -> tuple[tuple[int, ...], tuple[int, ...]]:
-        prompt = _SYSTEM_PROMPT + (
+    def _prompt_parts(
+        language: str | None, context: str | None = None
+    ) -> tuple[tuple[int, ...], tuple[int, ...]]:
+        prompt = system_turn(context) + (
             f"<|im_start|>user\n"
             f"{_AUDIO_START}{_AUDIO_PAD}{_AUDIO_END}"
             f"<|im_end|>\n"
@@ -156,9 +184,19 @@ def make_qwen3_asr_scheduler_adapters(
             tuple(template_ids[audio_pad_index + 1 :]),
         )
 
-    def _build_prompt_ids(num_audio_tokens: int, language: str | None) -> list[int]:
-        prefix_ids, suffix_ids = _prompt_parts(language)
-        return [*prefix_ids, *([audio_pad_token_id] * num_audio_tokens), *suffix_ids]
+    def _build_prompt_ids(
+        num_audio_tokens: int,
+        language: str | None,
+        context: str | None,
+        streaming_prefix_token_ids: list[int],
+    ) -> list[int]:
+        prefix_ids, suffix_ids = _prompt_parts(language, context)
+        return [
+            *prefix_ids,
+            *([audio_pad_token_id] * num_audio_tokens),
+            *suffix_ids,
+            *streaming_prefix_token_ids,
+        ]
 
     def _validate_context_budget(
         input_ids: list[int], request_max_new_tokens: int
@@ -179,6 +217,16 @@ def make_qwen3_asr_scheduler_adapters(
         payload: StagePayload,
     ) -> Qwen3ASRRequestData | DeferredAdmission:
         params = payload.request.params or {}
+        is_streaming_refresh = params.get("_asr_streaming") is True
+        streaming_prefix = params.get("_asr_streaming_prefix_text")
+        rollback_tokens = int(params.get("_asr_streaming_rollback_tokens", 0))
+        streaming_prefix_token_ids, retained_prefix_text = (
+            retained_streaming_prefix(
+                tokenizer, streaming_prefix or "", rollback_tokens
+            )
+            if is_streaming_refresh and streaming_prefix
+            else ([], "")
+        )
         temperature = float(params.get("temperature") or 0.0)
         if greedy_only and temperature != 0.0:
             raise ValueError(
@@ -190,6 +238,10 @@ def make_qwen3_asr_scheduler_adapters(
         forced_language = (
             None if requested_language is None else resolve_language(requested_language)
         )
+        # Note(Audrey): the checkpoint reads biasing text from the system turn.
+        raw_context = params.get("prompt")
+        bias_context = str(raw_context).strip() if raw_context else None
+        bias_context = bias_context or None
         try:
             prepared = prepare_audio(
                 payload, source_name="Qwen3-ASR", target_sample_rate=_SAMPLE_RATE
@@ -242,7 +294,10 @@ def make_qwen3_asr_scheduler_adapters(
             # cannot fit the configured context do not consume preprocessing
             # memory and CPU.
             estimated_input_ids = _build_prompt_ids(
-                estimated_audio_tokens, forced_language
+                estimated_audio_tokens,
+                forced_language,
+                bias_context,
+                streaming_prefix_token_ids,
             )
 
             if explicit_max_new_tokens is None:
@@ -296,7 +351,12 @@ def make_qwen3_asr_scheduler_adapters(
             estimated_input_ids
             if estimated_input_ids is not None
             and num_audio_tokens == estimated_audio_tokens
-            else _build_prompt_ids(num_audio_tokens, forced_language)
+            else _build_prompt_ids(
+                num_audio_tokens,
+                forced_language,
+                bias_context,
+                streaming_prefix_token_ids,
+            )
         )
         _validate_context_budget(input_ids, request_max_new_tokens)
 
@@ -377,6 +437,7 @@ def make_qwen3_asr_scheduler_adapters(
             audio_duration_s=audio_duration_s,
             language=requested_language,
             engine_start_s=time.perf_counter(),
+            streaming_prefix_text=retained_prefix_text,
             stage_payload=payload,
         )
         if audio_encoder_service is None or cached_embedding is not None:
@@ -401,15 +462,15 @@ def make_qwen3_asr_scheduler_adapters(
         # Keep the marker handling at token level. Byte-level BPE decode->encode
         # is not an identity transform for all whitespace/Unicode transcripts.
         if logger.isEnabledFor(logging.DEBUG):
-            raw = _decode_token_ids(tokenizer, output_ids, skip_special_tokens=False)
+            raw = decode_token_ids(tokenizer, output_ids, skip_special_tokens=False)
             logger.debug(
                 f"[qwen3-asr] n_out={len(output_ids)} "
                 f"ids={output_ids[:40]} raw={raw!r}"
             )
-        asr_text_idx = _find_subsequence(output_ids, asr_text_token_ids)
+        asr_text_idx = find_subsequence(output_ids, asr_text_token_ids)
         detected_language = None
         if data.language is None and asr_text_idx is not None:
-            prefix = _decode_token_ids(
+            prefix = decode_token_ids(
                 tokenizer,
                 output_ids[:asr_text_idx],
                 skip_special_tokens=True,
@@ -431,16 +492,20 @@ def make_qwen3_asr_scheduler_adapters(
             if asr_text_idx is not None
             else output_ids
         )
-        text = _decode_token_ids(tokenizer, transcript_ids, skip_special_tokens=True)
+        continuation = decode_token_ids(
+            tokenizer, transcript_ids, skip_special_tokens=True
+        )
+        transcript = f"{data.streaming_prefix_text}{continuation}"
         engine_time_s = (
             time.perf_counter() - data.engine_start_s if data.engine_start_s else 0.0
         )
+        resolved_language = data.language or detected_language
         return StagePayload(
             request_id=payload.request_id,
             request=payload.request,
             data={
-                "text": text,
-                "language": data.language or detected_language,
+                "text": transcript,
+                "language": resolved_language,
                 "duration_s": data.audio_duration_s,
                 "asr_latency_s": engine_time_s,
                 "usage": {"engine_time_s": engine_time_s},
@@ -462,12 +527,12 @@ def make_qwen3_asr_stream_output_builder(
         if eos_token_id is not None
         else (int(tokenizer_eos) if tokenizer_eos is not None else None)
     )
-    asr_text_token_ids = _encode_literal(tokenizer, _ASR_TEXT)
+    asr_text_token_ids = encode_literal(tokenizer, _ASR_TEXT)
     if not asr_text_token_ids:
         raise ValueError("Qwen3-ASR tokenizer produced no <asr_text> token IDs")
 
     token_stream_builder = make_token_text_stream_output_builder(
-        decode_fn=lambda ids: _decode_token_ids(
+        decode_fn=lambda ids: decode_token_ids(
             tokenizer, ids, skip_special_tokens=True
         ),
         build_message_data=lambda delta: {

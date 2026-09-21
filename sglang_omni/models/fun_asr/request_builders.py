@@ -45,6 +45,7 @@ _MIN_GENERATION_TOKENS = 16
 
 @dataclass
 class FunASRRequestData(SGLangARRequestData):
+    enforce_request_limits: bool = True
     prompt_token_ids: list[int] | None = None
     output_ids: list[int] | None = None
     num_audio_tokens: int = 0
@@ -53,7 +54,7 @@ class FunASRRequestData(SGLangARRequestData):
     engine_start_s: float = 0.0
 
 
-def _default_token_budget(audio_duration_s: float, max_new_tokens: int) -> int:
+def default_token_budget(audio_duration_s: float, max_new_tokens: int) -> int:
     proportional = math.ceil(
         audio_duration_s
         / _MAX_AUDIO_DURATION_S
@@ -62,12 +63,12 @@ def _default_token_budget(audio_duration_s: float, max_new_tokens: int) -> int:
     return min(max_new_tokens, max(_MIN_GENERATION_TOKENS, proportional))
 
 
-def _request_token_budget(
+def request_token_budget(
     params: dict[str, Any], audio_duration_s: float, max_new_tokens: int
 ) -> int:
     explicit = params.get("max_new_tokens")
     if explicit is None:
-        return _default_token_budget(audio_duration_s, max_new_tokens)
+        return default_token_budget(audio_duration_s, max_new_tokens)
 
     try:
         requested = int(explicit)
@@ -80,7 +81,7 @@ def _request_token_budget(
     return requested
 
 
-def _decode_token_ids(
+def decode_token_ids(
     tokenizer: Any, token_ids: list[int], *, skip_special_tokens: bool
 ) -> str:
     try:
@@ -93,7 +94,7 @@ def _decode_token_ids(
         return tokenizer.decode(token_ids, skip_special_tokens=skip_special_tokens)
 
 
-def _resolve_language(lang_raw: str | None) -> str | None:
+def resolve_language(lang_raw: str | None) -> str | None:
 
     if lang_raw is None:
         return None
@@ -107,7 +108,7 @@ def _resolve_language(lang_raw: str | None) -> str | None:
     return lang_raw.strip()
 
 
-def _build_prompt_text(language: str | None, itn: bool, hotwords: list[str]) -> str:
+def build_prompt_text(language: str | None, itn: bool, hotwords: list[str]) -> str:
 
     prompt = ""
     if hotwords:
@@ -126,7 +127,7 @@ def _build_prompt_text(language: str | None, itn: bool, hotwords: list[str]) -> 
     return prompt + "："
 
 
-def _prompt_template(prompt_text: str, num_audio_tokens: int) -> str:
+def prompt_template(prompt_text: str, num_audio_tokens: int) -> str:
 
     return (
         f"<|im_start|>system\nYou are a helpful assistant.<|im_end|>\n"
@@ -151,9 +152,9 @@ def fun_asr_prompt_overhead_tokens(
     prompt tokens. Tokenizing without audio pads is exact because
     ``_AUDIO_PAD`` is a special token with atomic boundaries.
     """
-    prompt_text = _build_prompt_text(language, itn, list(hotwords))
+    prompt_text = build_prompt_text(language, itn, list(hotwords))
     return len(
-        tokenizer(_prompt_template(prompt_text, 0), add_special_tokens=False).input_ids
+        tokenizer(prompt_template(prompt_text, 0), add_special_tokens=False).input_ids
     )
 
 
@@ -180,7 +181,7 @@ def make_fun_asr_scheduler_adapters(
 
     def _build_prompt_ids(num_audio_tokens: int, prompt_text: str) -> list[int]:
         return tokenizer(
-            _prompt_template(prompt_text, num_audio_tokens),
+            prompt_template(prompt_text, num_audio_tokens),
             add_special_tokens=False,
         ).input_ids
 
@@ -200,17 +201,12 @@ def make_fun_asr_scheduler_adapters(
         estimated_audio_tokens = None
         cached_embedding = None
         if audio_encoder_service is not None:
-            try:
-                estimated_audio_tokens = fun_asr_num_audio_tokens(
-                    len(audio),
-                    frame_length_samples=int(feature_extractor.n_fft),
-                    frame_shift_samples=int(feature_extractor.hop_length),
-                    lfr_n=int(feature_extractor.lfr_n),
-                )
-            except AttributeError as exc:
-                raise ValueError(
-                    "Fun-ASR feature extractor is missing n_fft, hop_length, or lfr_n"
-                ) from exc
+            estimated_audio_tokens = fun_asr_num_audio_tokens(
+                len(audio),
+                frame_length_samples=int(feature_extractor.n_fft),
+                frame_shift_samples=int(feature_extractor.hop_length),
+                lfr_n=int(feature_extractor.stride_lfr),
+            )
             cached_embedding = audio_encoder_service.lookup_cached_embedding(
                 fingerprint, estimated_audio_tokens
             )
@@ -230,7 +226,7 @@ def make_fun_asr_scheduler_adapters(
                     (features.shape[0], features.shape[-1]), dtype=torch.long
                 )
             num_lfr_frames = int(feature_attention_mask.sum().item())
-            num_audio_tokens = int(fun_asr_low_frame_rate_length(num_lfr_frames))
+            num_audio_tokens = fun_asr_low_frame_rate_length(num_lfr_frames)
             logger.debug(
                 f"[fun-asr] lfr_frames={num_lfr_frames} "
                 f"num_audio_tokens={num_audio_tokens} "
@@ -243,7 +239,7 @@ def make_fun_asr_scheduler_adapters(
             num_audio_tokens = estimated_audio_tokens
 
         lang_raw = params.get("language")
-        language = _resolve_language(lang_raw)
+        language = resolve_language(lang_raw)
         itn = bool(params.get("itn", True))
         hotwords_raw = params.get("hotwords") or []
         # A bare string would be split into characters by list(...); wrap it as
@@ -260,7 +256,7 @@ def make_fun_asr_scheduler_adapters(
                 hotwords = [
                     term.strip() for term in str(prompt_hint).split(",") if term.strip()
                 ]
-        prompt_text = _build_prompt_text(language, itn, hotwords)
+        prompt_text = build_prompt_text(language, itn, hotwords)
         input_ids = _build_prompt_ids(num_audio_tokens, prompt_text)
 
         audio_item = MultimodalDataItem(
@@ -299,7 +295,7 @@ def make_fun_asr_scheduler_adapters(
         mm_inputs.mrope_position_delta = torch.tensor([0], dtype=torch.long)
 
         temperature = float(params.get("temperature") or 0.0)
-        request_max_new_tokens = _request_token_budget(
+        request_max_new_tokens = request_token_budget(
             params, audio_duration_s, max_new_tokens
         )
         if (
@@ -357,7 +353,7 @@ def make_fun_asr_scheduler_adapters(
         payload = data.stage_payload
         output_ids = list(data.output_ids or [])
 
-        text = _decode_token_ids(tokenizer, output_ids, skip_special_tokens=True)
+        text = decode_token_ids(tokenizer, output_ids, skip_special_tokens=True)
         engine_time_s = (
             time.perf_counter() - data.engine_start_s if data.engine_start_s else 0.0
         )
@@ -401,7 +397,7 @@ def make_fun_asr_stream_output_builder(
         else (int(tokenizer_eos) if tokenizer_eos is not None else None)
     )
     return make_token_text_stream_output_builder(
-        decode_fn=lambda ids: _decode_token_ids(
+        decode_fn=lambda ids: decode_token_ids(
             tokenizer, ids, skip_special_tokens=True
         ),
         build_message_data=lambda delta: {

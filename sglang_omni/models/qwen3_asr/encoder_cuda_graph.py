@@ -12,12 +12,15 @@ from __future__ import annotations
 
 import logging
 from dataclasses import dataclass
-from typing import Any
+from typing import TYPE_CHECKING, Any
 
 import torch
 from sglang.srt.layers.attention.vision import VisionAttentionMetadata
 
 from sglang_omni.platforms import current_platform
+
+if TYPE_CHECKING:
+    from sglang_omni.platforms.device_graph import DeviceGraphBackend
 
 logger = logging.getLogger(__name__)
 
@@ -52,8 +55,8 @@ def build_buckets(max_batch: int, max_tokens_per_clip: int) -> tuple[int, ...]:
 
 
 @dataclass
-class _CapturedGraph:
-    graph: torch.cuda.CUDAGraph
+class CapturedGraph:
+    graph: Any  # the accelerator's graph type, named per backend
     hidden_states: torch.Tensor  # [bucket, hidden] static input
     cu_seqlens: torch.Tensor  # [max_windows + 1] static window boundaries
     attention_metadata: VisionAttentionMetadata | None
@@ -76,21 +79,24 @@ class Qwen3ASREncoderLayerStackGraphRunner:
         *,
         buckets: tuple[int, ...],
         max_batch_size: int,
+        graph_backend: DeviceGraphBackend,
     ) -> None:
         self._tower = audio_tower
+        self._graph_backend = graph_backend
         param = next(audio_tower.parameters())
         self._device = param.device
         self._dtype = param.dtype
+        self._device_module = torch.get_device_module(self._device)
         cfg = audio_tower.config
 
-        chunk_tokens = _get_feat_extract_output_lengths_int(cfg.n_window * 2)
+        chunk_tokens = get_feat_extract_output_lengths_int(cfg.n_window * 2)
         self._max_seqlen = chunk_tokens * (cfg.n_window_infer // (cfg.n_window * 2))
         self._max_windows_for = (
             lambda bucket_size: max_batch_size + bucket_size // self._max_seqlen + 1
         )
         top = buckets[-1]
         self._buckets = buckets[:-1] + (top + self._max_windows_for(top),)
-        self._graphs: dict[int, _CapturedGraph] = {}  # bucket size -> recorded graph
+        self._graphs: dict[int, CapturedGraph] = {}  # bucket size -> recorded graph
         self._failed: set[int] = set()
         self._capture_attention_metadata: VisionAttentionMetadata | None = None
 
@@ -104,7 +110,7 @@ class Qwen3ASREncoderLayerStackGraphRunner:
             if bucket_size in self._graphs or bucket_size in self._failed:
                 continue
             try:
-                self._graphs[bucket_size] = self._capture(bucket_size)
+                self._graphs[bucket_size] = self.capture(bucket_size)
             except Exception as exc:
                 logger.warning(
                     "[qwen3-asr] encoder graph capture failed for bucket=%d: %s; "
@@ -114,7 +120,7 @@ class Qwen3ASREncoderLayerStackGraphRunner:
                 )
                 self._failed.add(bucket_size)
 
-    def _layer_stack(
+    def layer_stack(
         self, hidden_states: torch.Tensor, cu_seqlens: torch.Tensor
     ) -> torch.Tensor:
         """The computation we capture: 24 layers + ln_post + proj chain."""
@@ -140,7 +146,7 @@ class Qwen3ASREncoderLayerStackGraphRunner:
         h = tower.act(h)
         return tower.proj2(h)[0]
 
-    def _capture(self, bucket_size: int) -> _CapturedGraph:
+    def capture(self, bucket_size: int) -> CapturedGraph:
         """Record one graph for a bucket-sized packed input."""
         device, dtype = self._device, self._dtype
         d_model = self._tower.ln_post.normalized_shape[0]
@@ -168,18 +174,21 @@ class Qwen3ASREncoderLayerStackGraphRunner:
 
         def run_once() -> torch.Tensor:
             with torch.no_grad():
-                return self._layer_stack(static_hs, static_cu)
+                return self.layer_stack(static_hs, static_cu)
 
-        side = torch.cuda.Stream(device)
-        side.wait_stream(torch.cuda.current_stream(device))
-        with torch.cuda.stream(side):
+        device_module = self._device_module
+        side = device_module.Stream(device)
+        side.wait_stream(device_module.current_stream(device))
+        with device_module.stream(side):
             for _ in range(3):
                 run_once()
-        torch.cuda.current_stream(device).wait_stream(side)
-        torch.cuda.synchronize(device)
+        device_module.current_stream(device).wait_stream(side)
+        device_module.synchronize(device)
 
-        graph = torch.cuda.CUDAGraph()
-        with torch.cuda.graph(graph, capture_error_mode="thread_local"):
+        # Note (siju): each bucket keeps its own pool. Sharing one is only safe
+        # for graphs replayed in capture order, and a request picks its bucket
+        # from the clip length, so any order is possible.
+        with self._graph_backend.capture(thread_local_errors=True) as graph:
             static_out = run_once()
         logger.info(
             "[qwen3-asr] captured encoder layer-stack graph bucket=%d windows=%d out=%s",
@@ -187,7 +196,7 @@ class Qwen3ASREncoderLayerStackGraphRunner:
             max_windows,
             tuple(static_out.shape),
         )
-        return _CapturedGraph(
+        return CapturedGraph(
             graph=graph,
             hidden_states=static_hs,
             cu_seqlens=static_cu,
@@ -205,7 +214,7 @@ class Qwen3ASREncoderLayerStackGraphRunner:
         if max(window_lens) > self._max_seqlen:
             return None
 
-        plan = self._plan(total, len(window_lens))
+        plan = self.plan(total, len(window_lens))
         if plan is None:
             return None
         bucket_size, dummy_sizes = plan
@@ -215,7 +224,7 @@ class Qwen3ASREncoderLayerStackGraphRunner:
         entry = self._graphs.get(bucket_size)
         if entry is None:
             try:
-                entry = self._capture(bucket_size)
+                entry = self.capture(bucket_size)
             except Exception as exc:
                 logger.warning(
                     "[qwen3-asr] encoder graph capture failed for bucket=%d: %s; "
@@ -242,7 +251,7 @@ class Qwen3ASREncoderLayerStackGraphRunner:
             out = out.squeeze(0)
         return out[:total].clone()
 
-    def _plan(self, total: int, real_windows: int) -> tuple[int, list[int]] | None:
+    def plan(self, total: int, real_windows: int) -> tuple[int, list[int]] | None:
         """Pick a bucket and the dummy-window sizes that absorb its padding."""
 
         for bucket_size in self._buckets:
@@ -264,7 +273,7 @@ class Qwen3ASREncoderLayerStackGraphRunner:
         return None
 
 
-def _get_feat_extract_output_lengths_int(frames: int) -> int:
+def get_feat_extract_output_lengths_int(frames: int) -> int:
     """Compute conv output length for a mel-frame count."""
     from .audio_lengths import qwen3_asr_num_audio_tokens
 
@@ -293,7 +302,7 @@ def eager_preamble(
         chunk_list, batch_first=True
     ).transpose(1, 2)
 
-    feature_lens_after_cnn = _get_feat_extract_output_lengths_tensor(chunk_lengths)
+    feature_lens_after_cnn = get_feat_extract_output_lengths_tensor(chunk_lengths)
     max_len_after_cnn = (
         int(feature_lens_after_cnn.max().item())
         if feature_lens_after_cnn.numel()
@@ -329,7 +338,7 @@ def eager_preamble(
     return padded_embed[padded_mask_after_cnn]
 
 
-def _get_feat_extract_output_lengths_tensor(
+def get_feat_extract_output_lengths_tensor(
     input_lengths: torch.Tensor,
 ) -> torch.Tensor:
     leave = input_lengths % 100
