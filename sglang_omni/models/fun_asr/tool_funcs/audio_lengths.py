@@ -29,6 +29,8 @@ def fun_asr_num_audio_tokens(
     for name, value in values.items():
         if value <= 0:
             raise ValueError(f"{name} must be positive, got {value}")
+        else:
+            pass
 
     mel_frames = (
         1
