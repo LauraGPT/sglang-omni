@@ -34,9 +34,14 @@ def test_ming_text_config_imports_and_uses_current_stage_schema() -> None:
     assert config.terminal_stages == ["decode"]
     stages = {stage.name: stage for stage in config.stages}
     assert stages["thinker"].stream_to == ["decode"]
+    assert (
+        stages["thinker"]
+        .project_payload["decode"]
+        .endswith("project_thinker_to_decode")
+    )
     assert stages["decode"].can_accept_stream_before_payload is True
     assert all(
-        stage.factory.startswith("sglang_omni.models.ming_omni.stages.create_")
+        stage.factory_path.startswith("sglang_omni.models.ming_omni.stages.create_")
         for stage in config.stages
     )
     assert all("executor" not in stage.model_dump() for stage in config.stages)
@@ -80,10 +85,115 @@ def test_ming_speech_config_routes_decode_and_talker() -> None:
     )
     assert stages["thinker"].next == ["decode", "talker"]
     assert stages["thinker"].stream_to == ["decode"]
+    assert (
+        stages["thinker"]
+        .project_payload["decode"]
+        .endswith("project_thinker_to_decode")
+    )
+    assert (
+        stages["thinker"]
+        .project_payload["talker"]
+        .endswith("project_thinker_to_talker")
+    )
     assert stages["decode"].terminal is True
     assert stages["decode"].can_accept_stream_before_payload is True
     assert stages["talker"].terminal is True
     assert config.terminal_stages == ["decode", "talker"]
+
+
+def test_ming_streaming_speech_config_projects_thinker_payloads() -> None:
+    from sglang_omni.models.ming_omni.config import (
+        MingOmniStreamingSpeechPipelineConfig,
+    )
+
+    config = MingOmniStreamingSpeechPipelineConfig(model_path="dummy")
+    stages = {stage.name: stage for stage in config.stages}
+
+    assert (
+        stages["thinker"]
+        .project_payload["decode"]
+        .endswith("project_thinker_to_decode")
+    )
+    assert (
+        stages["thinker"]
+        .project_payload["segmenter"]
+        .endswith("project_thinker_to_segmenter")
+    )
+
+
+def test_ming_thinker_projection_reduces_relay_payload_bytes() -> None:
+    import asyncio
+
+    import torch
+
+    from sglang_omni.comm import stage_io
+    from sglang_omni.comm.data_ref import TransportKind
+    from sglang_omni.models.ming_omni.io import MingOmniPipelineState
+    from sglang_omni.models.ming_omni.pipeline.next_stage import THINKER_STAGE
+    from sglang_omni.models.ming_omni.stages import (
+        project_thinker_to_decode,
+        project_thinker_to_segmenter,
+        project_thinker_to_talker,
+    )
+    from sglang_omni.proto import OmniRequest, StagePayload
+    from tests.unit_test.fixtures.pipeline_fakes import FakeRelay
+
+    thinker_out = {
+        "output_ids": list(range(8192)),
+        "step": 8192,
+        "is_final": True,
+        "finish_reason": "stop",
+        "extra_model_outputs": {"hidden_states": torch.ones(128)},
+    }
+    payload = StagePayload(
+        request_id="req-1",
+        request=OmniRequest(inputs={}),
+        data=MingOmniPipelineState(
+            prompt={"input_ids": list(range(256)), "prompt_text": "ignored"},
+            thinker_inputs={"inputs_embeds": torch.ones(64, 8)},
+            thinker_out=thinker_out,
+            engine_outputs={THINKER_STAGE: thinker_out},
+            stream_state={"emitted_ids": list(range(64))},
+        ).to_dict(),
+    )
+    projected = {
+        "decode": project_thinker_to_decode(payload),
+        "talker": project_thinker_to_talker(payload),
+        "segmenter": project_thinker_to_segmenter(payload),
+    }
+
+    async def serialized_sizes(candidate: StagePayload) -> tuple[int, int]:
+        data_ref, op = await stage_io.write_payload(
+            FakeRelay(),
+            candidate.request_id,
+            candidate,
+            transport=TransportKind.SHM,
+        )
+        await op.wait_for_completion()
+        relay_payload_bytes = data_ref.buffer.length
+        payload_pickle_b64_bytes = len(data_ref.header or "")
+        return relay_payload_bytes, payload_pickle_b64_bytes
+
+    async def compare_sizes() -> tuple[tuple[int, int], dict[str, tuple[int, int]]]:
+        original_sizes = await serialized_sizes(payload)
+        projected_sizes = {
+            stage: await serialized_sizes(candidate)
+            for stage, candidate in projected.items()
+        }
+        return original_sizes, projected_sizes
+
+    original_sizes, projected_sizes = asyncio.run(compare_sizes())
+
+    for stage, sizes in projected_sizes.items():
+        assert sizes[0] < original_sizes[0], stage
+        assert sizes[1] < original_sizes[1], stage
+    assert {stage: sizes[0] for stage, sizes in projected_sizes.items()} == {
+        "decode": 1,
+        "talker": 1,
+        "segmenter": 1,
+    }
+    assert "engine_outputs" not in projected["decode"].data
+    assert "engine_outputs" not in projected["talker"].data
 
 
 def test_ming_speech_launcher_exposes_tp_size_arg(monkeypatch) -> None:
@@ -135,7 +245,7 @@ def test_ming_speech_launcher_places_thinker_tp_and_talker(monkeypatch) -> None:
     stages = {stage.name: stage for stage in config.stages}
     thinker = stages["thinker"]
     talker = stages["talker"]
-    overrides = thinker.factory_args["server_args_overrides"]
+    overrides = thinker.engine.overrides() if thinker.engine is not None else {}
 
     assert thinker.tp_size == 4
     assert thinker.gpu == [0, 1, 2, 3]
@@ -207,7 +317,7 @@ def test_ming_talker_factory_returns_scheduler_contract(monkeypatch) -> None:
     scheduler = create_talker_executor(
         model_path="dummy",
         talker_model_path="talker",
-        device="cuda:1",
+        gpu_id=1,
         voice="DB30",
     )
 
@@ -224,8 +334,8 @@ def test_ming_audio_encoder_moves_inputs_to_component_device() -> None:
         encoding="utf-8"
     )
 
-    assert "audio_feats = audio_feats.to(device=self._device)" in source
-    assert "audio_feats_lengths = audio_feats_lengths.to(device=self._device)" in source
+    assert "audio_feats = audio_feats.to(device=self.device)" in source
+    assert "audio_feats_lengths = audio_feats_lengths.to(device=self.device)" in source
 
 
 def test_ming_preprocessor_computes_mel_feature_tuple(monkeypatch) -> None:
@@ -245,7 +355,7 @@ def test_ming_preprocessor_computes_mel_feature_tuple(monkeypatch) -> None:
     )
 
     mel_tensor, mel_len, audio_token_count = (
-        preprocessor._compute_mel_features_for_waveform(
+        preprocessor.compute_mel_features_for_waveform(
             waveform,
             ds_kernel_size=3,
             ds_stride=2,
@@ -608,6 +718,9 @@ def test_ming_thinker_factory_registers_hf_config_before_server_args(
         return SimpleNamespace(tp_size=1)
 
     backend_module.build_sglang_server_args = build_sglang_server_args
+    from sglang_omni.scheduling.sglang_backend import pin_resolved_device_type
+
+    backend_module.pin_resolved_device_type = pin_resolved_device_type
     monkeypatch.setitem(
         sys.modules,
         "sglang_omni.scheduling.sglang_backend",
@@ -653,7 +766,7 @@ def test_ming_arch_override_uses_composite_llm_config() -> None:
         num_hidden_layers=None,
     )
 
-    ModelWorker._apply_arch_override(model_config, "BailingMoeV2ForCausalLM")
+    ModelWorker.apply_arch_override(model_config, "BailingMoeV2ForCausalLM")
 
     assert model_config.hf_config.architectures == ["BailingMoeV2ForCausalLM"]
     assert model_config.hf_text_config is llm_config
@@ -715,14 +828,14 @@ def test_ming_init_model_config_registers_auto_config_before_loading(
     worker.server_args = SimpleNamespace(model_path="dummy", revision=None)
     worker.model_arch_override = "BailingMoeV2ForCausalLM"
 
-    worker._init_model_config()
+    worker.init_model_config()
 
     assert call_order == ["register", "from_server_args"]
 
 
 def test_ming_decode_metadata_includes_usage_and_finish_reason() -> None:
     from sglang_omni.models.ming_omni.components.streaming_detokenizer import (
-        _attach_decode_final_metadata,
+        attach_decode_final_metadata,
     )
     from sglang_omni.models.ming_omni.io import MingOmniPipelineState
 
@@ -737,7 +850,7 @@ def test_ming_decode_metadata_includes_usage_and_finish_reason() -> None:
     }
     result: dict[str, object] = {}
 
-    _attach_decode_final_metadata(result, state, thinker_out)
+    attach_decode_final_metadata(result, state, thinker_out)
 
     assert result["finish_reason"] == "length"
     assert result["usage"] == {
@@ -754,14 +867,14 @@ def test_ming_preprocessor_injects_top_level_videos_as_inline_content() -> None:
     the preprocessor handles top-level and inline video requests identically.
     """
     from sglang_omni.models.ming_omni.components.preprocessor import (
-        _inject_top_level_videos,
+        inject_top_level_videos,
     )
 
     messages = [
         {"role": "system", "content": "你是助手"},
         {"role": "user", "content": "What is happening?"},
     ]
-    out = _inject_top_level_videos(messages, ["/tmp/clip.mp4"])
+    out = inject_top_level_videos(messages, ["/tmp/clip.mp4"])
 
     # System message untouched, only first user message extended.
     assert out[0] == {"role": "system", "content": "你是助手"}
@@ -774,6 +887,40 @@ def test_ming_preprocessor_injects_top_level_videos_as_inline_content() -> None:
     ]
     # Original list unchanged (helper does a shallow copy).
     assert messages[1]["content"] == "What is happening?"
+
+
+def test_ming_preprocessor_uses_dedicated_video_processor_contract() -> None:
+    import numpy as np
+    import torch
+
+    from sglang_omni.models.ming_omni.components.preprocessor import MingPreprocessor
+
+    class FakeVideoProcessor:
+        def __init__(self) -> None:
+            self.calls = []
+
+        def preprocess(self, videos, *, return_tensors):
+            self.calls.append((videos, return_tensors))
+            return {
+                "pixel_values_videos": torch.zeros((8, 16)),
+                "video_grid_thw": torch.tensor([[2, 4, 4]]),
+            }
+
+    preprocessor = MingPreprocessor.__new__(MingPreprocessor)
+    preprocessor.video_processor = FakeVideoProcessor()
+    preprocessor.vision_config = SimpleNamespace(spatial_merge_size=2)
+
+    frames = torch.zeros((4, 3, 8, 8), dtype=torch.float32)
+    pixel_values, grid, token_counts = preprocessor.process_videos([frames])
+
+    assert tuple(pixel_values.shape) == (8, 16)
+    assert grid.tolist() == [[2, 4, 4]]
+    assert token_counts == [8]
+    videos, return_tensors = preprocessor.video_processor.calls[0]
+    assert return_tensors == "pt"
+    assert len(videos) == 1
+    assert videos[0].shape == (4, 8, 8, 3)
+    assert videos[0].dtype == np.uint8
 
 
 def test_ming_image_encoder_forward_accepts_video_inputs() -> None:
@@ -848,6 +995,57 @@ def test_ming_merge_extracts_video_embeds_into_thinker_inputs() -> None:
     assert result["media_cache_keys"]["video"] == "video:img:abc|vid:def"
 
 
+def test_ming_merge_clears_encoder_outputs_after_building_thinker_inputs() -> None:
+    import torch
+
+    from sglang_omni.models.ming_omni.io import MingOmniPipelineState
+    from sglang_omni.models.ming_omni.pipeline.merge import merge_for_thinker
+    from sglang_omni.models.ming_omni.pipeline.next_stage import (
+        AUDIO_STAGE,
+        IMAGE_STAGE,
+        PREPROCESSING_STAGE,
+    )
+    from sglang_omni.proto import OmniRequest, StagePayload
+
+    request = OmniRequest(inputs={})
+
+    def payload(stage_state: MingOmniPipelineState) -> StagePayload:
+        return StagePayload(
+            request_id="req-1",
+            request=request,
+            data=stage_state.to_dict(),
+        )
+
+    merged = merge_for_thinker(
+        {
+            PREPROCESSING_STAGE: payload(
+                MingOmniPipelineState(
+                    prompt={"input_ids": [1, 2, 3]},
+                    encoder_inputs={
+                        AUDIO_STAGE: {"cache_key": "audio-cache"},
+                        IMAGE_STAGE: {"cache_key": "image-cache"},
+                    },
+                )
+            ),
+            AUDIO_STAGE: payload(
+                MingOmniPipelineState(
+                    encoder_outs={AUDIO_STAGE: {"audio_embeds": torch.ones(1, 4, 8)}}
+                )
+            ),
+            IMAGE_STAGE: payload(
+                MingOmniPipelineState(
+                    encoder_outs={IMAGE_STAGE: {"image_embeds": torch.ones(1, 2, 8)}}
+                )
+            ),
+        }
+    )
+
+    state = MingOmniPipelineState.from_dict(merged.data)
+    assert state.thinker_inputs
+    assert state.encoder_outs == {}
+    assert state.encoder_inputs == {}
+
+
 def test_compute_video_cache_key_changes_with_decode_params() -> None:
     """Different fps/max_frames/pixel limits must produce distinct cache keys.
 
@@ -894,7 +1092,7 @@ def test_compute_video_cache_key_changes_with_decode_params() -> None:
     assert compute_video_cache_key([], fps=8.0) is None
 
 
-def _make_fake_ming_image_encoder(spatial_merge_size: int = 2):
+def make_fake_ming_image_encoder(spatial_merge_size: int = 2):
     """Build a MingImageEncoder shell whose ``_encode`` returns synthetic
     tensors with the real shape contract (embeds rows == sum(token_counts)).
 
@@ -908,7 +1106,7 @@ def _make_fake_ming_image_encoder(spatial_merge_size: int = 2):
     from sglang_omni.models.ming_omni.components.image_encoder import MingImageEncoder
 
     enc = object.__new__(MingImageEncoder)
-    enc.__dict__["_spatial_merge_size"] = spatial_merge_size
+    enc.__dict__["spatial_merge_size"] = spatial_merge_size
     enc.__dict__["visual"] = types.SimpleNamespace(device=torch.device("cpu"))
 
     def fake_encode(pixel_values, grid_thw):
@@ -918,7 +1116,7 @@ def _make_fake_ming_image_encoder(spatial_merge_size: int = 2):
         embeds = torch.zeros(total, 8)  # hidden_dim doesn't matter for shape test
         return embeds, token_counts
 
-    enc.__dict__["_encode"] = fake_encode
+    enc.__dict__["encode"] = fake_encode
     return enc
 
 
@@ -934,7 +1132,7 @@ def test_ming_image_encoder_forward_video_embeds_match_token_counts() -> None:
 
     from sglang_omni.models.ming_omni.components.image_encoder import MingImageEncoder
 
-    enc = _make_fake_ming_image_encoder()
+    enc = make_fake_ming_image_encoder()
     # Two videos: (t=2, h=4, w=4) and (t=1, h=6, w=6).
     # With merge_sq=4: tokens = 8 and 9, total = 17.
     video_grid_thw = torch.tensor([[2, 4, 4], [1, 6, 6]], dtype=torch.long)
@@ -960,7 +1158,7 @@ def test_ming_image_encoder_forward_handles_image_and_video_together() -> None:
 
     from sglang_omni.models.ming_omni.components.image_encoder import MingImageEncoder
 
-    enc = _make_fake_ming_image_encoder()
+    enc = make_fake_ming_image_encoder()
     out = MingImageEncoder.forward(
         enc,
         pixel_values=torch.zeros(50, 16),
@@ -997,7 +1195,7 @@ def test_ming_image_encoder_forward_skips_video_when_grid_thw_missing() -> None:
 
     from sglang_omni.models.ming_omni.components.image_encoder import MingImageEncoder
 
-    enc = _make_fake_ming_image_encoder()
+    enc = make_fake_ming_image_encoder()
 
     # pixel_values_videos without video_grid_thw -> skipped.
     out = MingImageEncoder.forward(

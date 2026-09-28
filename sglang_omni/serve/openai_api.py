@@ -4,8 +4,10 @@
 Provides the following endpoints:
 - POST /v1/chat/completions  — Text (+ audio) chat completions
 - POST /v1/audio/speech      — Text-to-speech synthesis
+- POST /v1/audio/translations — Translate audio speech to English
 - POST /v1/audio/speech/batch — Batch text-to-speech synthesis
 - WS   /v1/audio/speech/stream — Stateful TTS WebSocket streaming
+- POST /v1/audio/transcriptions — Speech-to-text transcription
 - GET  /v1/audio/voices      — List preset and uploaded TTS voices
 - POST /v1/audio/voices      — Upload a persistent TTS reference voice
 - DELETE /v1/audio/voices/{name} — Delete an uploaded TTS voice
@@ -19,14 +21,13 @@ Provides the following endpoints:
 from __future__ import annotations
 
 import asyncio
-import io
 import json
 import logging
-import math
 import time
 import uuid
 from collections.abc import Awaitable, Callable
-from contextlib import suppress
+from contextlib import aclosing, suppress
+from dataclasses import asdict
 from typing import Any, AsyncIterator
 
 from fastapi import (
@@ -40,13 +41,9 @@ from fastapi import (
     WebSocket,
 )
 from fastapi.middleware.cors import CORSMiddleware
-from fastapi.responses import (
-    JSONResponse,
-    PlainTextResponse,
-    Response,
-    StreamingResponse,
-)
+from fastapi.responses import JSONResponse, Response, StreamingResponse
 
+from sglang_omni import __version__
 from sglang_omni.client import (
     Client,
     ClientError,
@@ -61,12 +58,24 @@ from sglang_omni.client.audio import (
     encode_pcm,
     select_audio_delta,
 )
+from sglang_omni.config import (
+    CustomVoiceConfig,
+    RealtimeTranscriptionConfig,
+    ResolvedAudioChunking,
+)
+from sglang_omni.config.schema import MAX_SPEECH_INPUT_CHARS
 from sglang_omni.http.admin_auth import (
     make_admin_auth_dependency,
     resolve_admin_api_key,
 )
 from sglang_omni.http.favicon import register_favicon
-from sglang_omni.proto import EXPLICIT_GENERATION_PARAMS_KEY
+from sglang_omni.proto import EXPLICIT_STAGE_SAMPLING_PARAMS_KEY
+from sglang_omni.serve.generation_params import (
+    record_explicit_generation_params as _record_explicit_generation_params,
+)
+from sglang_omni.serve.openai_errors import (
+    is_bad_request_error as _is_bad_request_error,
+)
 from sglang_omni.serve.protocol import (
     DEFAULT_TTS_BATCH_MAX_ITEMS,
     AdminRequestBase,
@@ -91,52 +100,44 @@ from sglang_omni.serve.protocol import (
     RolloutGenerateRequest,
     RolloutSamplingParams,
     SpeechBatchResponse,
-    TranscriptionResponse,
-    TranscriptionTextDeltaEvent,
-    TranscriptionTextDoneEvent,
-    TranscriptionUsage,
     UpdateWeightFromDiskRequest,
     UpdateWeightsFromDistributedRequest,
     UsageResponse,
     VoiceListResponse,
     WeightsCheckerRequest,
 )
+from sglang_omni.serve.realtime.manager import RealtimeDeployment
+from sglang_omni.serve.realtime.schema import CapabilityResponse
 from sglang_omni.serve.speech_errors import (
     SpeechAPIError,
     bad_request,
-    internal_error,
     openai_error_payload,
     speech_error_response,
+    speech_generation_error,
+)
+from sglang_omni.serve.speech_limits import (
+    MAX_VOICE_UPLOAD_BODY_BYTES,
+    MAX_VOICE_UPLOAD_BYTES,
 )
 from sglang_omni.serve.speech_service import SpeechRequestValidator
-from sglang_omni.serve.speech_voices import MAX_VOICE_UPLOAD_BYTES, SpeakerSampleStore
+from sglang_omni.serve.speech_voices import SpeakerSampleStore
 from sglang_omni.serve.speech_ws import SpeechWebSocketSession
-from sglang_omni.serve.transcription_adapters import resolve_adapter
+from sglang_omni.serve.streaming import STREAM_DONE_SENTINEL
+from sglang_omni.serve.streaming import (
+    ClosableStreamingResponse as _ClosableStreamingResponse,
+)
+from sglang_omni.serve.streaming import (
+    close_async_iterator_if_supported as _close_async_iterator_if_supported,
+)
+from sglang_omni.serve.transcriptions import LongAudioAdmission, register_transcriptions
+from sglang_omni.serve.translations import register_translations
 
 logger = logging.getLogger(__name__)
-STREAM_DONE_SENTINEL = "[DONE]"
 HTTP_DISCONNECT_POLL_INTERVAL_S = 0.05
 HTTP_DISCONNECT_CANCEL_TIMEOUT_S = 0.1
-VOICE_UPLOAD_MULTIPART_OVERHEAD_BYTES = 64 * 1024
-MAX_VOICE_UPLOAD_BODY_BYTES = (
-    MAX_VOICE_UPLOAD_BYTES + VOICE_UPLOAD_MULTIPART_OVERHEAD_BYTES
-)
-
-_BAD_REQUEST_MARKERS = (
-    "longer than the model's context length",
-    "Requested token count exceeds the model's maximum context length",
-    "accepts audio up to",
-    "max_new_tokens must be",
-    "multimodal_train_inputs",
-)
 
 
-def _is_bad_request_error(exc: Exception) -> bool:
-    message = str(exc)
-    return any(marker in message for marker in _BAD_REQUEST_MARKERS)
-
-
-class _RequestBodyTooLarge(Exception):
+class RequestBodyTooLarge(Exception):
     pass
 
 
@@ -153,14 +154,21 @@ class VoiceUploadBodyLimitMiddleware:
         receive: Callable[[], Awaitable[dict[str, Any]]],
         send: Callable[[dict[str, Any]], Awaitable[None]],
     ) -> None:
-        if not _is_voice_upload_scope(scope):
+        if not is_voice_upload_scope(scope):
             await self.app(scope, receive, send)
             return
+        else:
+            pass
 
-        content_length = _content_length(scope)
-        if content_length is not None and content_length > self.max_bytes:
-            await _send_voice_upload_too_large(send, self.max_bytes)
+        request_content_length = content_length(scope)
+        if (
+            request_content_length is not None
+            and request_content_length > self.max_bytes
+        ):
+            await send_voice_upload_too_large(send, self.max_bytes)
             return
+        else:
+            pass
 
         received_bytes = 0
 
@@ -170,13 +178,17 @@ class VoiceUploadBodyLimitMiddleware:
             if message["type"] == "http.request":
                 received_bytes += len(message.get("body", b""))
                 if received_bytes > self.max_bytes:
-                    raise _RequestBodyTooLarge
+                    raise RequestBodyTooLarge
+                else:
+                    pass
+            else:
+                pass
             return message
 
         try:
             await self.app(scope, limited_receive, send)
-        except _RequestBodyTooLarge:
-            await _send_voice_upload_too_large(send, self.max_bytes)
+        except RequestBodyTooLarge:
+            await send_voice_upload_too_large(send, self.max_bytes)
 
 
 def create_app(
@@ -185,15 +197,23 @@ def create_app(
     model_name: str | None = None,
     requires_uploaded_voice_for_named_voice: bool = False,
     supports_uploaded_voice_references: bool = True,
+    custom_voice_config: CustomVoiceConfig | None = None,
+    supports_audio_translation: bool = False,
     required_speech_reference_count: int | None = None,
     speech_reference_text_required: bool = False,
+    speech_reference_text_excludes_instructions: bool = False,
     additional_speech_languages: frozenset[str] = frozenset(),
+    max_speech_input_chars: int | None = MAX_SPEECH_INPUT_CHARS,
     enable_realtime: bool = False,
+    realtime_deployment: RealtimeDeployment | None = None,
+    supports_realtime_audio_output: bool = False,
+    realtime_transcription: RealtimeTranscriptionConfig | None = None,
     allowed_local_media_path: str | None = None,
     allowed_media_domains: list[str] | None = None,
     admin_api_key: str | None = None,
     tts_batch_max_items: int = DEFAULT_TTS_BATCH_MAX_ITEMS,
     architectures: list[str] | None = None,
+    audio_chunking: ResolvedAudioChunking | None = None,
 ) -> FastAPI:
     """Create a FastAPI application with OpenAI-compatible endpoints.
 
@@ -204,24 +224,39 @@ def create_app(
             names must resolve to uploaded voices before reaching the model.
         supports_uploaded_voice_references: Whether uploaded voice names can be
             lowered into backend reference-audio requests.
+        custom_voice_config: Checkpoint speaker names and task type for CustomVoice.
+            When present, reference inputs and uploaded-voice resolution are disabled.
+        supports_audio_translation: Whether the configured pipeline supports
+            ``/v1/audio/translations``.
         required_speech_reference_count: Exact reference count required before
             dispatching a speech request to the backend.
         speech_reference_text_required: Whether each speech reference requires
             a transcript.
+        speech_reference_text_excludes_instructions: Whether a reference
+            transcript and style instructions are mutually exclusive.
         additional_speech_languages: Pipeline-specific accepted languages.
+        max_speech_input_chars: Maximum accepted input characters, or ``None``
+            to defer length validation to model-specific context checks.
         enable_realtime: If True, mount the WebSocket ``/v1/realtime``
             endpoint (OpenAI Realtime API).
-        allowed_local_media_path: Directory allowed for ``file://`` TTS
-            reference audio.
+        supports_realtime_audio_output: Whether the mounted realtime endpoint
+            can request streamed audio from the configured pipeline.
+        realtime_transcription: Pipeline-owned live-ASR strategy declaration.
+        allowed_local_media_path: Directory that local media references in TTS
+            requests must resolve inside. ``file://`` references are disabled
+            when omitted; bare local paths remain allowed by default but are
+            also restricted to this directory once it is configured.
         allowed_media_domains: Domains allowed for remote TTS reference audio.
         admin_api_key: Optional API key for admin-control endpoints.
         tts_batch_max_items: Maximum items accepted by
             ``/v1/audio/speech/batch``.
+        audio_chunking: Long-audio chunking policy for ``/v1/audio/transcriptions``,
+            declared by the pipeline config. None keeps chunking off.
 
     Returns:
         Configured FastAPI application.
     """
-    app = FastAPI(title="sglang-omni", version="0.1.0")
+    app = FastAPI(title="sglang-omni", version=__version__)
 
     app.add_middleware(
         CORSMiddleware,
@@ -239,17 +274,30 @@ def create_app(
     app.state.client = client
     app.state.model_name = model_name or "sglang-omni"
     app.state.architectures = [a for a in (architectures or []) if a]
-    app.state.realtime_enabled = enable_realtime
+    app.state.supports_audio_translation = supports_audio_translation
+    app.state.audio_chunking = audio_chunking or ResolvedAudioChunking.disabled()
+    app.state.long_audio_admission = LongAudioAdmission(
+        app.state.audio_chunking.max_concurrent_long_audio_requests
+    )
+    app.state.realtime_deployment = realtime_deployment
+    app.state.realtime_enabled = enable_realtime or realtime_deployment is not None
+    app.state.supports_realtime_audio_output = supports_realtime_audio_output
+    app.state.realtime_transcription = realtime_transcription
     app.state.speaker_sample_store = SpeakerSampleStore()
     app.state.speech_service = SpeechRequestValidator(
         default_model=app.state.model_name,
+        custom_voice_config=custom_voice_config,
         requires_uploaded_voice_for_named_voice=(
             requires_uploaded_voice_for_named_voice
         ),
         supports_uploaded_voice_references=supports_uploaded_voice_references,
         required_speech_reference_count=required_speech_reference_count,
         speech_reference_text_required=speech_reference_text_required,
+        speech_reference_text_excludes_instructions=(
+            speech_reference_text_excludes_instructions
+        ),
         additional_speech_languages=additional_speech_languages,
+        max_speech_input_chars=max_speech_input_chars,
         allowed_local_media_path=allowed_local_media_path,
         allowed_media_domains=allowed_media_domains,
         voice_store=app.state.speaker_sample_store,
@@ -260,27 +308,44 @@ def create_app(
 
     # Register all routes
     register_favicon(app)
-    _register_health(app)
-    _register_models(app)
-    _register_admin(app, resolved_key)
-    _register_chat_completions(app)
-    _register_voices(app)
-    _register_generate(app)
-    _register_speech(app)
-    _register_speech_batch(app)
-    _register_speech_ws(app)
-    _register_transcriptions(app)
-    if enable_realtime:
-        _register_realtime(app)
+    register_health(app)
+    register_models(app)
+    register_admin(app, resolved_key)
+    register_chat_completions(app)
+    register_voices(app)
+    register_generate(app)
+    register_speech(app)
+    register_speech_batch(app)
+    register_speech_ws(app)
+    register_transcriptions(app)
+    register_translations(app)
+    if enable_realtime or realtime_deployment is not None:
+        register_realtime(app)
+    else:
+        pass
 
     return app
 
 
-def _register_voices(app: FastAPI) -> None:
+def register_voices(app: FastAPI) -> None:
     @app.get("/v1/audio/voices")
-    async def list_voices() -> JSONResponse:
+    async def list_voices(names_only: bool = False) -> JSONResponse:
         voice_store: SpeakerSampleStore = app.state.speaker_sample_store
-        response = VoiceListResponse.model_validate(voice_store.list_response())
+        if names_only:
+            return JSONResponse(
+                content={"uploaded_voice_names": voice_store.uploaded_voice_names()}
+            )
+        else:
+            pass
+        voice_list = voice_store.list_response()
+        custom_voice_config = app.state.speech_service.custom_voice_config
+        if custom_voice_config is not None:
+            voices = {name.casefold(): name for name in custom_voice_config.speakers}
+            voices["default"] = "default"
+            voice_list["voices"] = sorted(voices.values(), key=str.casefold)
+        else:
+            pass
+        response = VoiceListResponse.model_validate(voice_list)
         return JSONResponse(content=response.model_dump(exclude_none=True))
 
     @app.post("/v1/audio/voices")
@@ -296,7 +361,7 @@ def _register_voices(app: FastAPI) -> None:
             response = voice_store.upload(
                 name=name,
                 consent=consent,
-                audio_bytes=await _read_voice_upload(audio_sample),
+                audio_bytes=await read_voice_upload(audio_sample),
                 filename=audio_sample.filename,
                 content_type=audio_sample.content_type,
                 ref_text=ref_text,
@@ -318,6 +383,8 @@ def _register_voices(app: FastAPI) -> None:
                 status_code=404,
                 content={"success": False, "error": f"Voice '{name}' not found"},
             )
+        else:
+            pass
         return JSONResponse(
             content={
                 "success": True,
@@ -326,17 +393,19 @@ def _register_voices(app: FastAPI) -> None:
         )
 
 
-async def _read_voice_upload(audio_sample: UploadFile) -> bytes:
+async def read_voice_upload(audio_sample: UploadFile) -> bytes:
     audio_bytes = await audio_sample.read(MAX_VOICE_UPLOAD_BYTES + 1)
     if len(audio_bytes) > MAX_VOICE_UPLOAD_BYTES:
         raise bad_request(
             f"audio_sample must be at most {MAX_VOICE_UPLOAD_BYTES} bytes",
             param="audio_sample",
         )
+    else:
+        pass
     return audio_bytes
 
 
-def _is_voice_upload_scope(scope: dict[str, Any]) -> bool:
+def is_voice_upload_scope(scope: dict[str, Any]) -> bool:
     return (
         scope.get("type") == "http"
         and scope.get("method") == "POST"
@@ -344,10 +413,12 @@ def _is_voice_upload_scope(scope: dict[str, Any]) -> bool:
     )
 
 
-def _content_length(scope: dict[str, Any]) -> int | None:
+def content_length(scope: dict[str, Any]) -> int | None:
     for name, value in scope.get("headers", ()):
         if name.lower() != b"content-length":
             continue
+        else:
+            pass
         try:
             return int(value.decode("ascii"))
         except ValueError:
@@ -355,7 +426,7 @@ def _content_length(scope: dict[str, Any]) -> int | None:
     return None
 
 
-async def _send_voice_upload_too_large(
+async def send_voice_upload_too_large(
     send: Callable[[dict[str, Any]], Awaitable[None]],
     max_bytes: int,
 ) -> None:
@@ -380,7 +451,7 @@ async def _send_voice_upload_too_large(
     await send({"type": "http.response.body", "body": body})
 
 
-def _register_health(app: FastAPI) -> None:
+def register_health(app: FastAPI) -> None:
     @app.get("/health")
     async def health() -> JSONResponse:
         """Health check endpoint (includes filesystem browse info)."""
@@ -397,7 +468,7 @@ def _register_health(app: FastAPI) -> None:
         )
 
 
-def _register_models(app: FastAPI) -> None:
+def register_models(app: FastAPI) -> None:
     @app.get("/v1/models")
     async def list_models() -> JSONResponse:
         """List available models."""
@@ -414,45 +485,45 @@ def _register_models(app: FastAPI) -> None:
         return JSONResponse(content=model_list.model_dump())
 
 
-def _register_admin(app: FastAPI, admin_api_key: str | None = None) -> None:
+def register_admin(app: FastAPI, admin_api_key: str | None = None) -> None:
     _auth = make_admin_auth_dependency(admin_api_key)
 
     @app.get("/model_info", dependencies=[Depends(_auth)])
     async def model_info_get() -> JSONResponse:
         client: Client = app.state.client
-        return _model_info_response(await client.model_info())
+        return model_info_response(await client.model_info())
 
     @app.post("/model_info", dependencies=[Depends(_auth)])
     async def model_info_post(req: AdminRequestBase) -> JSONResponse:
         client: Client = app.state.client
-        return _model_info_response(
+        return model_info_response(
             await client.model_info(
                 stages=req.stages,
-                timeout_s=_timeout_or_default(req.timeout_s, 30.0),
+                timeout_s=timeout_or_default(req.timeout_s, 30.0),
             )
         )
 
     @app.post("/pause_generation", dependencies=[Depends(_auth)])
     async def pause_generation(req: PauseGenerationRequest) -> JSONResponse:
         client: Client = app.state.client
-        payload = _request_payload(req)
-        return _admin_response(
+        payload = request_payload(req)
+        return admin_response(
             await client.pause_generation(
                 payload,
                 stages=req.stages,
-                timeout_s=_timeout_or_default(req.timeout_s, 60.0),
+                timeout_s=timeout_or_default(req.timeout_s, 60.0),
             )
         )
 
     @app.post("/continue_generation", dependencies=[Depends(_auth)])
     async def continue_generation(req: ContinueGenerationRequest) -> JSONResponse:
         client: Client = app.state.client
-        payload = _request_payload(req)
-        return _admin_response(
+        payload = request_payload(req)
+        return admin_response(
             await client.continue_generation(
                 payload,
                 stages=req.stages,
-                timeout_s=_timeout_or_default(req.timeout_s, 60.0),
+                timeout_s=timeout_or_default(req.timeout_s, 60.0),
             )
         )
 
@@ -461,12 +532,12 @@ def _register_admin(app: FastAPI, admin_api_key: str | None = None) -> None:
         req: UpdateWeightFromDiskRequest,
     ) -> JSONResponse:
         client: Client = app.state.client
-        payload = _request_payload(req)
-        return _admin_response(
+        payload = request_payload(req)
+        return admin_response(
             await client.update_weights_from_disk(
                 payload,
                 stages=req.stages,
-                timeout_s=_timeout_or_default(req.timeout_s, 120.0),
+                timeout_s=timeout_or_default(req.timeout_s, 120.0),
             )
         )
 
@@ -492,12 +563,12 @@ def _register_admin(app: FastAPI, admin_api_key: str | None = None) -> None:
         req: InitWeightsUpdateGroupRequest,
     ) -> JSONResponse:
         client: Client = app.state.client
-        payload = _request_payload(req)
-        return _admin_response(
+        payload = request_payload(req)
+        return admin_response(
             await client.init_weights_update_group(
                 payload,
                 stages=req.stages,
-                timeout_s=_timeout_or_default(req.timeout_s, 300.0),
+                timeout_s=timeout_or_default(req.timeout_s, 300.0),
             )
         )
 
@@ -506,12 +577,12 @@ def _register_admin(app: FastAPI, admin_api_key: str | None = None) -> None:
         req: DestroyWeightsUpdateGroupRequest,
     ) -> JSONResponse:
         client: Client = app.state.client
-        payload = _request_payload(req)
-        return _admin_response(
+        payload = request_payload(req)
+        return admin_response(
             await client.destroy_weights_update_group(
                 payload,
                 stages=req.stages,
-                timeout_s=_timeout_or_default(req.timeout_s, 300.0),
+                timeout_s=timeout_or_default(req.timeout_s, 300.0),
             )
         )
 
@@ -520,53 +591,57 @@ def _register_admin(app: FastAPI, admin_api_key: str | None = None) -> None:
         req: UpdateWeightsFromDistributedRequest,
     ) -> JSONResponse:
         client: Client = app.state.client
-        payload = _request_payload(req)
-        return _admin_response(
+        payload = request_payload(req)
+        return admin_response(
             await client.update_weights_from_distributed(
                 payload,
                 stages=req.stages,
-                timeout_s=_timeout_or_default(req.timeout_s, 300.0),
+                timeout_s=timeout_or_default(req.timeout_s, 300.0),
             )
         )
 
     @app.get("/weights_checker", dependencies=[Depends(_auth)])
     async def weights_checker_get(action: str = "checksum") -> JSONResponse:
         client: Client = app.state.client
-        return _admin_response(await client.weights_checker({"action": action}))
+        return admin_response(await client.weights_checker({"action": action}))
 
     @app.post("/weights_checker", dependencies=[Depends(_auth)])
     async def weights_checker_post(req: WeightsCheckerRequest) -> JSONResponse:
         client: Client = app.state.client
-        payload = _request_payload(req)
-        return _admin_response(
+        payload = request_payload(req)
+        return admin_response(
             await client.weights_checker(
                 payload,
                 stages=req.stages,
-                timeout_s=_timeout_or_default(req.timeout_s, 120.0),
+                timeout_s=timeout_or_default(req.timeout_s, 120.0),
             )
         )
 
 
-def _timeout_or_default(timeout_s: float | None, default: float) -> float:
+def timeout_or_default(timeout_s: float | None, default: float) -> float:
     return default if timeout_s is None else timeout_s
 
 
-def _request_payload(req: AdminRequestBase) -> dict[str, Any]:
+def request_payload(req: AdminRequestBase) -> dict[str, Any]:
     return req.model_dump(exclude={"stages", "timeout_s"}, exclude_none=True)
 
 
-def _admin_response(result: dict[str, Any]) -> JSONResponse:
+def admin_response(result: dict[str, Any]) -> JSONResponse:
     if not result.get("success", False):
         raise HTTPException(status_code=400, detail=result)
+    else:
+        pass
     return JSONResponse(content=result)
 
 
-def _model_info_response(result: dict[str, Any]) -> JSONResponse:
+def model_info_response(result: dict[str, Any]) -> JSONResponse:
     if not result.get("success", False):
         raise HTTPException(status_code=400, detail=result)
+    else:
+        pass
 
-    stage_infos = _extract_model_info_stage_data(result)
-    weight_version = _common_model_info_value(
+    stage_infos = extract_model_info_stage_data(result)
+    weight_version = common_model_info_value(
         result,
         stage_infos,
         "weight_version",
@@ -576,24 +651,30 @@ def _model_info_response(result: dict[str, Any]) -> JSONResponse:
     payload.update(
         {
             "weight_version": weight_version,
-            "model_path": _common_model_info_value(result, stage_infos, "model_path"),
-            "load_format": _common_model_info_value(result, stage_infos, "load_format"),
+            "model_path": common_model_info_value(result, stage_infos, "model_path"),
+            "load_format": common_model_info_value(result, stage_infos, "load_format"),
             "stages": result.get("results", []),
         }
     )
     return JSONResponse(content=payload)
 
 
-def _extract_model_info_stage_data(result: dict[str, Any]) -> list[dict[str, Any]]:
+def extract_model_info_stage_data(result: dict[str, Any]) -> list[dict[str, Any]]:
     infos: list[dict[str, Any]] = []
     for item in result.get("results", []) or []:
         if not isinstance(item, dict):
             continue
+        else:
+            pass
         data = item.get("data")
         if not isinstance(data, dict):
             continue
+        else:
+            pass
         if data.get("skipped") or data.get("unsupported"):
             continue
+        else:
+            pass
         stage_info = dict(data)
         stage_info.setdefault("stage", item.get("stage"))
         stage_info.setdefault("success", item.get("success"))
@@ -601,7 +682,7 @@ def _extract_model_info_stage_data(result: dict[str, Any]) -> list[dict[str, Any
     return infos
 
 
-def _common_model_info_value(
+def common_model_info_value(
     result: dict[str, Any],
     stage_infos: list[dict[str, Any]],
     key: str,
@@ -611,12 +692,16 @@ def _common_model_info_value(
     values = [info[key] for info in stage_infos if info.get(key) is not None]
     if not values:
         return None
+    else:
+        pass
 
     unique: dict[str, Any] = {}
     for value in values:
         unique.setdefault(json.dumps(value, sort_keys=True, default=str), value)
     if len(unique) == 1:
         return next(iter(unique.values()))
+    else:
+        pass
     if mixed_status_code is not None:
         raise HTTPException(
             status_code=mixed_status_code,
@@ -628,10 +713,12 @@ def _common_model_info_value(
                 "admin": result,
             },
         )
+    else:
+        pass
     return None
 
 
-def _register_chat_completions(app: FastAPI) -> None:
+def register_chat_completions(app: FastAPI) -> None:
     @app.post("/v1/chat/completions")
     async def chat_completions(req: ChatCompletionRequest) -> Response:
         client: Client = app.state.client
@@ -642,16 +729,18 @@ def _register_chat_completions(app: FastAPI) -> None:
         created = int(time.time())
         model = req.model or default_model
 
-        gen_req = _build_chat_generate_request(req)
+        gen_req = build_chat_generate_request(req)
 
         # Determine audio format from request
         audio_format = "wav"
         if req.audio and isinstance(req.audio, dict):
             audio_format = req.audio.get("format", "wav")
+        else:
+            pass
 
         if req.stream:
-            return StreamingResponse(
-                _chat_stream(
+            return _ClosableStreamingResponse(
+                chat_stream(
                     client,
                     gen_req,
                     request_id,
@@ -663,8 +752,10 @@ def _register_chat_completions(app: FastAPI) -> None:
                 ),
                 media_type="text/event-stream",
             )
+        else:
+            pass
 
-        return await _chat_non_stream(
+        return await chat_non_stream(
             client,
             gen_req,
             request_id,
@@ -676,7 +767,7 @@ def _register_chat_completions(app: FastAPI) -> None:
         )
 
 
-async def _chat_non_stream(
+async def chat_non_stream(
     client: Client,
     gen_req: GenerateRequest,
     request_id: str,
@@ -696,11 +787,15 @@ async def _chat_non_stream(
     except ClientError as exc:
         if _is_bad_request_error(exc):
             raise HTTPException(status_code=400, detail=str(exc)) from exc
+        else:
+            pass
         raise HTTPException(status_code=500, detail=str(exc)) from exc
     except Exception as exc:
         logger.exception("Error generating response for request %s", request_id)
         if _is_bad_request_error(exc):
             raise HTTPException(status_code=400, detail=str(exc)) from exc
+        else:
+            pass
         raise HTTPException(status_code=500, detail=str(exc)) from exc
 
     requested_modalities = req.modalities or ["text"]
@@ -710,6 +805,8 @@ async def _chat_non_stream(
 
     if "text" in requested_modalities and result.text:
         message["content"] = result.text
+    else:
+        pass
 
     if "audio" in requested_modalities and result.audio is not None:
         message["audio"] = {
@@ -717,9 +814,13 @@ async def _chat_non_stream(
             "data": result.audio.data,
             "transcript": result.audio.transcript,
         }
+    else:
+        pass
 
     if "content" not in message and "audio" not in message:
         message["content"] = result.text
+    else:
+        pass
 
     # Build usage
     usage = None
@@ -729,6 +830,8 @@ async def _chat_non_stream(
             completion_tokens=result.usage.completion_tokens or 0,
             total_tokens=result.usage.total_tokens or 0,
         )
+    else:
+        pass
 
     response = ChatCompletionResponse(
         id=response_id,
@@ -747,7 +850,7 @@ async def _chat_non_stream(
     return JSONResponse(content=response.model_dump())
 
 
-async def _chat_stream(
+async def chat_stream(
     client: Client,
     gen_req: GenerateRequest,
     request_id: str,
@@ -756,87 +859,107 @@ async def _chat_stream(
     model: str,
     req: ChatCompletionRequest,
     audio_format: str,
-):
+) -> AsyncIterator[str]:
     """Streaming chat completion generator (yields SSE events)."""
     role_sent = False
     requested_modalities = req.modalities or ["text"]
     finish_reason: str | None = None
     final_usage: UsageResponse | None = None
 
-    async for chunk in client.completion_stream(
+    chunk_stream = client.completion_stream(
         gen_req,
         request_id=request_id,
         audio_format=audio_format,
-    ):
-        # Capture finish info for the dedicated finish chunk after the loop.
-        # Some pipelines only emit a final aggregate chunk; do not drop its
-        # text/audio just because it already carries a finish reason.
-        if chunk.finish_reason is not None:
-            finish_reason = chunk.finish_reason
-            if chunk.usage is not None:
-                final_usage = UsageResponse(
-                    prompt_tokens=chunk.usage.prompt_tokens or 0,
-                    completion_tokens=chunk.usage.completion_tokens or 0,
-                    total_tokens=chunk.usage.total_tokens or 0,
+    )
+    async with aclosing(chunk_stream):
+        async for chunk in chunk_stream:
+            # Capture finish info for the dedicated finish chunk after the loop.
+            # Some pipelines only emit a final aggregate chunk; do not drop its
+            # text/audio just because it already carries a finish reason.
+            if chunk.finish_reason is not None:
+                finish_reason = chunk.finish_reason
+                if chunk.usage is not None:
+                    final_usage = UsageResponse(
+                        prompt_tokens=chunk.usage.prompt_tokens or 0,
+                        completion_tokens=chunk.usage.completion_tokens or 0,
+                        total_tokens=chunk.usage.total_tokens or 0,
+                    )
+                else:
+                    pass
+                has_payload = (
+                    chunk.modality == "text"
+                    and bool(chunk.text)
+                    and "text" in requested_modalities
+                ) or (
+                    chunk.modality == "audio"
+                    and chunk.audio_b64 is not None
+                    and "audio" in requested_modalities
                 )
-            has_payload = (
+                if not has_payload:
+                    continue
+                else:
+                    pass
+            else:
+                pass
+
+            delta = ChatCompletionStreamDelta()
+            emit = False
+
+            # Send role on first chunk
+            if not role_sent:
+                delta.role = "assistant"
+                role_sent = True
+                emit = True
+            else:
+                pass
+
+            # Text chunk
+            if (
                 chunk.modality == "text"
-                and bool(chunk.text)
+                and chunk.text
                 and "text" in requested_modalities
-            ) or (
+            ):
+                delta.content = chunk.text
+                emit = True
+            else:
+                pass
+
+            # Audio chunk
+            if (
                 chunk.modality == "audio"
                 and chunk.audio_b64 is not None
                 and "audio" in requested_modalities
-            )
-            if not has_payload:
-                continue
-
-        delta = ChatCompletionStreamDelta()
-        emit = False
-
-        # Send role on first chunk
-        if not role_sent:
-            delta.role = "assistant"
-            role_sent = True
-            emit = True
-
-        # Text chunk
-        if chunk.modality == "text" and chunk.text and "text" in requested_modalities:
-            delta.content = chunk.text
-            emit = True
-
-        # Audio chunk
-        if (
-            chunk.modality == "audio"
-            and chunk.audio_b64 is not None
-            and "audio" in requested_modalities
-        ):
-            delta.audio = ChatCompletionAudio(
-                id=f"audio-{request_id}",
-                data=chunk.audio_b64,
-            )
-            emit = True
-
-        if not emit:
-            continue
-
-        stream_resp = ChatCompletionStreamResponse(
-            id=response_id,
-            created=created,
-            model=model,
-            choices=[
-                ChatCompletionStreamChoice(
-                    index=0,
-                    delta=delta,
-                    finish_reason=None,
+            ):
+                delta.audio = ChatCompletionAudio(
+                    id=f"audio-{request_id}",
+                    data=chunk.audio_b64,
                 )
-            ],
-        )
+                emit = True
+            else:
+                pass
 
-        data = stream_resp.model_dump(exclude_none=True)
-        for choice in data.get("choices", []):
-            choice.setdefault("finish_reason", None)
-        yield f"data: {json.dumps(data)}\n\n"
+            if not emit:
+                continue
+            else:
+                pass
+
+            stream_resp = ChatCompletionStreamResponse(
+                id=response_id,
+                created=created,
+                model=model,
+                choices=[
+                    ChatCompletionStreamChoice(
+                        index=0,
+                        delta=delta,
+                        finish_reason=None,
+                    )
+                ],
+            )
+
+            data = stream_resp.model_dump(exclude_none=True)
+            for choice in data.get("choices", []):
+                choice.setdefault("finish_reason", None)
+            yield f"data: {json.dumps(data)}\n\n"
 
     # Finish chunk: empty delta + finish_reason.
     finish_resp = ChatCompletionStreamResponse(
@@ -860,7 +983,7 @@ async def _chat_stream(
     yield f"data: {STREAM_DONE_SENTINEL}\n\n"
 
 
-def _explicit_generation_params(request: Any) -> list[str]:
+def explicit_generation_params(request: Any) -> list[str]:
     fields_set = getattr(request, "model_fields_set", set())
     return sorted(
         field
@@ -875,15 +998,7 @@ def _explicit_generation_params(request: Any) -> list[str]:
     )
 
 
-def _record_explicit_generation_params(
-    metadata: dict[str, Any],
-    explicit_fields: list[str],
-) -> None:
-    if explicit_fields:
-        metadata[EXPLICIT_GENERATION_PARAMS_KEY] = explicit_fields
-
-
-def _build_chat_generate_request(req: ChatCompletionRequest) -> GenerateRequest:
+def build_chat_generate_request(req: ChatCompletionRequest) -> GenerateRequest:
     """Convert a ChatCompletionRequest into a client GenerateRequest."""
     # Parse stop sequences
     stop: list[str] = []
@@ -891,6 +1006,8 @@ def _build_chat_generate_request(req: ChatCompletionRequest) -> GenerateRequest:
         stop = [req.stop]
     elif isinstance(req.stop, list):
         stop = list(req.stop)
+    else:
+        pass
 
     # Build sampling params
     sampling = SamplingParams(
@@ -918,43 +1035,75 @@ def _build_chat_generate_request(req: ChatCompletionRequest) -> GenerateRequest:
         stage_sampling = {}
         for stage_name, params_dict in req.stage_sampling.items():
             stage_sampling[stage_name] = SamplingParams(**params_dict)
+    else:
+        pass
 
     # Extract audios, images, and videos from request
     audios: list[str] | None = None
     if req.audios:
         audios = req.audios
+    else:
+        pass
 
     images: list[str] | None = None
     if req.images:
         images = req.images
+    else:
+        pass
 
     videos: list[str] | None = None
     if req.videos:
         videos = req.videos
+    else:
+        pass
 
     # Merge audio config, audios, images, and videos into metadata
     metadata: dict[str, Any] = {}
+    if req.stage_sampling:
+        metadata[EXPLICIT_STAGE_SAMPLING_PARAMS_KEY] = {
+            name: list(params) for name, params in req.stage_sampling.items()
+        }
+    else:
+        pass
     if req.audio:
         metadata["audio_config"] = req.audio
+    else:
+        pass
     if audios:
         metadata["audios"] = audios
+    else:
+        pass
     if images:
         metadata["images"] = images
+    else:
+        pass
     if videos:
         metadata["videos"] = videos
+    else:
+        pass
     if req.video_fps is not None:
         metadata["video_fps"] = req.video_fps
+    else:
+        pass
     if req.video_max_frames is not None:
         metadata["video_max_frames"] = req.video_max_frames
+    else:
+        pass
     if req.video_min_pixels is not None:
         metadata["video_min_pixels"] = req.video_min_pixels
+    else:
+        pass
     if req.video_max_pixels is not None:
         metadata["video_max_pixels"] = req.video_max_pixels
+    else:
+        pass
     if req.video_total_pixels is not None:
         metadata["video_total_pixels"] = req.video_total_pixels
+    else:
+        pass
     _record_explicit_generation_params(
         metadata,
-        _explicit_generation_params(req),
+        explicit_generation_params(req),
     )
 
     extra_params: dict[str, Any] = {}
@@ -967,6 +1116,8 @@ def _build_chat_generate_request(req: ChatCompletionRequest) -> GenerateRequest:
     ):
         if value is not None:
             extra_params[field_name] = value
+        else:
+            pass
 
     return GenerateRequest(
         model=req.model,
@@ -982,7 +1133,7 @@ def _build_chat_generate_request(req: ChatCompletionRequest) -> GenerateRequest:
     )
 
 
-def _register_generate(app: FastAPI) -> None:
+def register_generate(app: FastAPI) -> None:
     @app.post("/generate")
     async def generate(req: RolloutGenerateRequest) -> Response:
         client: Client = app.state.client
@@ -995,17 +1146,21 @@ def _register_generate(app: FastAPI) -> None:
                 status_code=400,
                 detail="exactly one of input_ids, prompt, or messages is required",
             )
+        else:
+            pass
         if req.stream:
             raise HTTPException(
                 status_code=400,
                 detail="stream=true is not supported by /generate yet",
             )
+        else:
+            pass
 
         request_id = str(uuid.uuid4())
         audio_format = "wav"
 
         try:
-            gen_req = _build_rollout_generate_request(req)
+            gen_req = build_rollout_generate_request(req)
             result = await client.completion(
                 gen_req,
                 request_id=request_id,
@@ -1014,6 +1169,8 @@ def _register_generate(app: FastAPI) -> None:
         except ClientError as exc:
             if _is_bad_request_error(exc):
                 raise HTTPException(status_code=400, detail=str(exc)) from exc
+            else:
+                pass
             raise HTTPException(status_code=500, detail=str(exc)) from exc
         except ValueError as exc:
             raise HTTPException(status_code=400, detail=str(exc)) from exc
@@ -1021,13 +1178,15 @@ def _register_generate(app: FastAPI) -> None:
             logger.exception("Error generating rollout for request %s", request_id)
             if _is_bad_request_error(exc):
                 raise HTTPException(status_code=400, detail=str(exc)) from exc
+            else:
+                pass
             raise HTTPException(status_code=500, detail=str(exc)) from exc
 
-        response = _build_generate_response(req, result, audio_format)
+        response = build_generate_response(req, result, audio_format)
         return JSONResponse(content=response.model_dump())
 
 
-def _rollout_sampling_to_client(params: RolloutSamplingParams) -> SamplingParams:
+def rollout_sampling_to_client(params: RolloutSamplingParams) -> SamplingParams:
     kwargs: dict[str, Any] = {}
     for key, value in (
         ("temperature", params.temperature),
@@ -1041,29 +1200,39 @@ def _rollout_sampling_to_client(params: RolloutSamplingParams) -> SamplingParams
     ):
         if value is not None:
             kwargs[key] = value
+        else:
+            pass
     if params.stop is not None:
         kwargs["stop"] = (
             [params.stop] if isinstance(params.stop, str) else list(params.stop)
         )
+    else:
+        pass
     if "max_new_tokens" not in kwargs and params.max_tokens is not None:
         kwargs["max_new_tokens"] = params.max_tokens
+    else:
+        pass
     return SamplingParams(**kwargs)
 
 
-def _build_rollout_generate_request(req: RolloutGenerateRequest) -> GenerateRequest:
+def build_rollout_generate_request(req: RolloutGenerateRequest) -> GenerateRequest:
     """Convert a rollout GenerateRequest into a client GenerateRequest."""
-    sampling = _rollout_sampling_to_client(req.sampling_params)
+    sampling = rollout_sampling_to_client(req.sampling_params)
 
     messages: list[Message] | None = None
     if req.messages is not None:
         messages = [Message(role=m.role, content=m.content) for m in req.messages]
+    else:
+        pass
 
     stage_sampling: dict[str, SamplingParams] | None = None
     if req.stage_sampling:
         stage_sampling = {
-            name: _rollout_sampling_to_client(params)
+            name: rollout_sampling_to_client(params)
             for name, params in req.stage_sampling.items()
         }
+    else:
+        pass
 
     extra_params: dict[str, Any] = {
         "return_logprob": req.return_logprob,
@@ -1072,9 +1241,21 @@ def _build_rollout_generate_request(req: RolloutGenerateRequest) -> GenerateRequ
         "return_indexer_topk": req.return_indexer_topk,
     }
     metadata = dict(req.metadata) if req.metadata else {}
+    if req.stage_sampling:
+        metadata[EXPLICIT_STAGE_SAMPLING_PARAMS_KEY] = {
+            name: sorted(
+                {
+                    "max_new_tokens" if key == "max_tokens" else key
+                    for key in params.model_fields_set
+                }
+            )
+            for name, params in req.stage_sampling.items()
+        }
+    else:
+        pass
     _record_explicit_generation_params(
         metadata,
-        _explicit_generation_params(req.sampling_params),
+        explicit_generation_params(req.sampling_params),
     )
 
     return GenerateRequest(
@@ -1100,7 +1281,7 @@ def _build_rollout_generate_request(req: RolloutGenerateRequest) -> GenerateRequ
     )
 
 
-def _build_generate_response(
+def build_generate_response(
     req: RolloutGenerateRequest,
     result: CompletionResult,
     audio_format: str,
@@ -1136,6 +1317,8 @@ def _build_generate_response(
                 "audio (set return_omni_rollout=true for audio logprobs)"
             ),
         )
+    else:
+        pass
     if (
         req.return_logprob
         and result.output_token_logprobs is not None
@@ -1149,9 +1332,13 @@ def _build_generate_response(
                 f"completion_tokens={completion_tokens}"
             ),
         )
+    else:
+        pass
     audio: GenerateAudio | None = None
     if result.audio is not None:
         audio = GenerateAudio(data=result.audio.data, format=audio_format)
+    else:
+        pass
 
     meta_info = GenerateMetaInfo(
         finish_reason=finish_reason,
@@ -1167,26 +1354,121 @@ def _build_generate_response(
     return GenerateResponse(text=result.text, audio=audio, meta_info=meta_info)
 
 
-def _register_realtime(app: FastAPI) -> None:
+def realtime_unavailable_response(message: str) -> JSONResponse:
+    return JSONResponse(
+        {"error": {"code": "unavailable", "message": message}}, status_code=503
+    )
+
+
+def register_realtime(app: FastAPI) -> None:
     """Mount the OpenAI-compatible WebSocket Realtime endpoint."""
     from sglang_omni.serve.realtime import RealtimeSessionManager
+    from sglang_omni.serve.realtime.smart_turn import load_smart_turn
 
     client: Client = app.state.client
     model_name: str = app.state.model_name
-    manager = RealtimeSessionManager(client=client, model_name=model_name)
+    deployment = app.state.realtime_deployment
+    if deployment is None:
+        try:
+            smart_turn_model = load_smart_turn()
+        except Exception:
+            logger.warning(
+                "Smart Turn model could not be loaded; semantic VAD will fall back "
+                "to server VAD",
+                exc_info=True,
+            )
+            smart_turn_model = None
+    else:
+        smart_turn_model = None
+    manager = RealtimeSessionManager(
+        deployment=deployment,
+        client=client,
+        model_name=model_name,
+        supports_audio_output=app.state.supports_realtime_audio_output,
+        transcription_config=app.state.realtime_transcription,
+        smart_turn_model=smart_turn_model,
+    )
     app.state.realtime_manager = manager
+
+    if deployment is not None:
+
+        @app.get("/v1/realtime/capabilities", response_model=None)
+        async def realtime_capabilities() -> CapabilityResponse | JSONResponse:
+            if not client.health().get("running", False):
+                return realtime_unavailable_response("instance is not ready")
+            else:
+                return {
+                    "model": model_name,
+                    **deployment.capabilities.to_granted_capabilities(),
+                    "limits": asdict(deployment.limits),
+                }
+
+    else:
+        pass
 
     @app.websocket("/v1/realtime")
     async def realtime(websocket: WebSocket) -> None:
-        await websocket.accept()
-        session = manager.open(websocket)
-        try:
-            await session.run()
-        finally:
-            await manager.close(session.session_id)
+        if deployment is not None and len(manager.sessions) >= (
+            deployment.max_connections
+        ):
+            await websocket.send_denial_response(
+                realtime_unavailable_response("connection capacity exhausted")
+            )
+        elif deployment is not None and (
+            "session_id" in websocket.query_params
+            or websocket.query_params.get("model", model_name) != model_name
+        ):
+            await websocket.close(code=1008)
+        else:
+            # Note (Junnan Li): Open before accept; a shared deployment counts the connection before the upgrade yields.
+            try:
+                session = manager.open(
+                    websocket,
+                    intent=websocket.query_params.get("intent", "conversation"),
+                )
+            except ValueError as exc:
+                await websocket.accept()
+                await websocket.send_json(
+                    {
+                        "type": "error",
+                        "error": {
+                            "type": "invalid_request_error",
+                            "code": "unsupported_realtime_intent",
+                            "message": str(exc),
+                        },
+                    }
+                )
+                await websocket.close(code=1008)
+            else:
+                try:
+                    await websocket.accept()
+                    await session.run()
+                finally:
+                    await manager.close(session.session_id)
 
 
-def _register_speech(app: FastAPI) -> None:
+def speech_generation_failure_response(
+    request_id: str,
+    exc: BaseException,
+    *,
+    unexpected_message: str | None = None,
+) -> JSONResponse:
+    mapped = speech_generation_error(exc)
+    if mapped.status_code not in (400, 503):
+        logger.exception(
+            unexpected_message or "Error generating speech for request %s",
+            request_id,
+        )
+    else:
+        logger.warning(
+            "Rejecting speech request %s: %s",
+            request_id,
+            mapped.message,
+        )
+    return speech_error_response(mapped)
+
+
+def register_speech(app: FastAPI) -> None:
     @app.post("/v1/audio/speech")
     async def create_speech(request: Request) -> Response:
         client: Client = app.state.client
@@ -1214,7 +1496,7 @@ def _register_speech(app: FastAPI) -> None:
 
         if req.stream:
             try:
-                return await _speech_audio_response(
+                return await speech_audio_response(
                     request=request,
                     client=client,
                     gen_req=gen_req,
@@ -1222,16 +1504,20 @@ def _register_speech(app: FastAPI) -> None:
                     speed=req.speed,
                 )
             except ClientError as exc:
-                return speech_error_response(internal_error(str(exc)))
+                return speech_generation_failure_response(request_id, exc)
             except Exception as exc:
-                logger.exception(
-                    "Error preparing raw PCM speech stream for request %s",
+                return speech_generation_failure_response(
                     request_id,
+                    exc,
+                    unexpected_message=(
+                        "Error preparing raw PCM speech stream for request %s"
+                    ),
                 )
-                return speech_error_response(internal_error(str(exc)))
+        else:
+            pass
 
         try:
-            result = await _await_speech_response(
+            result = await await_speech_response(
                 request=request,
                 client=client,
                 gen_req=gen_req,
@@ -1240,21 +1526,38 @@ def _register_speech(app: FastAPI) -> None:
                 speed=req.speed,
             )
         except ClientError as exc:
-            return speech_error_response(internal_error(str(exc)))
+            return speech_generation_failure_response(request_id, exc)
         except Exception as exc:
-            logger.exception("Error generating speech for request %s", request_id)
-            return speech_error_response(internal_error(str(exc)))
+            return speech_generation_failure_response(
+                request_id,
+                exc,
+                unexpected_message="Error generating speech for request %s",
+            )
 
         headers = {
             "Content-Disposition": f'attachment; filename="speech.{result.format}"',
         }
+        if result.finish_reason is not None:
+            # note (Junnan Li): the body is binary audio, so the terminal state
+            # travels in the same X- header channel as usage.
+            headers["X-Finish-Reason"] = str(result.finish_reason)
+        else:
+            pass
         if result.usage is not None:
             if result.usage.prompt_tokens is not None:
                 headers["X-Prompt-Tokens"] = str(result.usage.prompt_tokens)
+            else:
+                pass
             if result.usage.completion_tokens is not None:
                 headers["X-Completion-Tokens"] = str(result.usage.completion_tokens)
+            else:
+                pass
             if result.usage.engine_time_s is not None:
                 headers["X-Engine-Time"] = str(result.usage.engine_time_s)
+            else:
+                pass
+        else:
+            pass
 
         return Response(
             content=result.audio_bytes,
@@ -1263,7 +1566,7 @@ def _register_speech(app: FastAPI) -> None:
         )
 
 
-def _register_speech_batch(app: FastAPI) -> None:
+def register_speech_batch(app: FastAPI) -> None:
     @app.post("/v1/audio/speech/batch")
     async def create_speech_batch(request: Request) -> JSONResponse:
         client: Client = app.state.client
@@ -1272,7 +1575,7 @@ def _register_speech_batch(app: FastAPI) -> None:
         try:
             payload = await request.json()
             batch = await asyncio.to_thread(speech_service.parse_batch_request, payload)
-            response = await _create_speech_batch_with_disconnect_watch(
+            response = await create_speech_batch_with_disconnect_watch(
                 request,
                 client=client,
                 speech_service=speech_service,
@@ -1286,14 +1589,24 @@ def _register_speech_batch(app: FastAPI) -> None:
         except SpeechAPIError as exc:
             return speech_error_response(exc)
         except Exception as exc:
-            logger.exception("Error generating speech batch for request %s", request_id)
-            return speech_error_response(internal_error(str(exc)))
+            mapped = speech_generation_error(exc)
+            if mapped.status_code not in (400, 503):
+                logger.exception(
+                    "Error generating speech batch for request %s", request_id
+                )
+            else:
+                logger.warning(
+                    "Rejecting speech batch request %s: %s",
+                    request_id,
+                    mapped.message,
+                )
+            return speech_error_response(mapped)
 
         response = SpeechBatchResponse.model_validate(response)
         return JSONResponse(content=response.model_dump(exclude_none=True))
 
 
-async def _create_speech_batch_with_disconnect_watch(
+async def create_speech_batch_with_disconnect_watch(
     request: Request,
     *,
     client: Client,
@@ -1308,7 +1621,7 @@ async def _create_speech_batch_with_disconnect_watch(
             request_id=request_id,
         )
     )
-    disconnect_task = asyncio.create_task(_wait_for_request_disconnect(request))
+    disconnect_task = asyncio.create_task(wait_for_request_disconnect(request))
     try:
         done, _ = await asyncio.wait(
             {batch_task, disconnect_task},
@@ -1316,6 +1629,8 @@ async def _create_speech_batch_with_disconnect_watch(
         )
         if batch_task in done:
             return await batch_task
+        else:
+            pass
 
         batch_task.cancel()
         with suppress(asyncio.CancelledError):
@@ -1323,10 +1638,12 @@ async def _create_speech_batch_with_disconnect_watch(
         raise asyncio.CancelledError
     finally:
         if not disconnect_task.done():
-            await _cancel_task_bounded(disconnect_task)
+            await cancel_task_bounded(disconnect_task)
+        else:
+            pass
 
 
-def _register_speech_ws(app: FastAPI) -> None:
+def register_speech_ws(app: FastAPI) -> None:
     @app.websocket("/v1/audio/speech/stream")
     async def speech_stream(websocket: WebSocket) -> None:
         await websocket.accept()
@@ -1338,7 +1655,7 @@ def _register_speech_ws(app: FastAPI) -> None:
         await session.run()
 
 
-def _speech_pcm_chunk_bytes(
+def speech_pcm_chunk_bytes(
     chunk: Any,
     *,
     emitted_samples: int,
@@ -1352,16 +1669,22 @@ def _speech_pcm_chunk_bytes(
     )
     if audio_data is None:
         return None, emitted_samples, sample_rate
+    else:
+        pass
 
     if speed != 1.0:
         audio_data, sample_rate = apply_speed(audio_data, speed, sample_rate)
+    else:
+        pass
     audio_bytes = encode_pcm(audio_data, sample_rate)
     if not audio_bytes:
         return None, emitted_samples, sample_rate
+    else:
+        pass
     return audio_bytes, emitted_samples, sample_rate
 
 
-async def _speech_audio_response(
+async def speech_audio_response(
     request: Request,
     client: Client,
     gen_req: GenerateRequest,
@@ -1375,7 +1698,7 @@ async def _speech_audio_response(
     stream_sample_rate: int | None = None
     stream_completed = False
     stream_closed = False
-    disconnect_task = asyncio.create_task(_wait_for_request_disconnect(request))
+    disconnect_task = asyncio.create_task(wait_for_request_disconnect(request))
     next_chunk_task: asyncio.Task[Any] | None = None
 
     try:
@@ -1387,10 +1710,14 @@ async def _speech_audio_response(
             )
             if disconnect_task in done:
                 if not next_chunk_task.done():
-                    await _cancel_task_bounded(next_chunk_task)
-                await _abort_and_close_speech_stream(client, request_id, chunk_stream)
+                    await cancel_task_bounded(next_chunk_task)
+                else:
+                    pass
+                await abort_and_close_speech_stream(client, request_id, chunk_stream)
                 stream_closed = True
                 raise asyncio.CancelledError
+            else:
+                pass
 
             try:
                 chunk = next_chunk_task.result()
@@ -1399,9 +1726,11 @@ async def _speech_audio_response(
                 break
             if chunk.audio_data is None:
                 continue
+            else:
+                pass
 
             first_audio_bytes, emitted_samples, stream_sample_rate = (
-                _speech_pcm_chunk_bytes(
+                speech_pcm_chunk_bytes(
                     chunk,
                     emitted_samples=emitted_samples,
                     speed=speed,
@@ -1409,24 +1738,34 @@ async def _speech_audio_response(
             )
             if first_audio_bytes is not None:
                 break
+            else:
+                pass
 
         if first_audio_bytes is None or stream_sample_rate is None:
             raise RuntimeError("No audio output generated from the pipeline.")
+        else:
+            pass
     except asyncio.CancelledError:
         if not stream_closed:
-            await _abort_and_close_speech_stream(client, request_id, chunk_stream)
+            await abort_and_close_speech_stream(client, request_id, chunk_stream)
+        else:
+            pass
         raise
     except Exception:
         if not stream_completed:
-            await _abort_and_close_speech_stream(client, request_id, chunk_stream)
+            await abort_and_close_speech_stream(client, request_id, chunk_stream)
         else:
             await _close_async_iterator_if_supported(chunk_stream)
         raise
     finally:
         if next_chunk_task is not None and not next_chunk_task.done():
-            await _cancel_task_bounded(next_chunk_task)
+            await cancel_task_bounded(next_chunk_task)
+        else:
+            pass
         if not disconnect_task.done():
-            await _cancel_task_bounded(disconnect_task)
+            await cancel_task_bounded(disconnect_task)
+        else:
+            pass
 
     async def _body():
         nonlocal emitted_samples
@@ -1437,24 +1776,30 @@ async def _speech_audio_response(
             async for chunk in chunk_stream:
                 if chunk.audio_data is None:
                     continue
+                else:
+                    pass
 
-                audio_bytes, emitted_samples, sample_rate = _speech_pcm_chunk_bytes(
+                audio_bytes, emitted_samples, sample_rate = speech_pcm_chunk_bytes(
                     chunk,
                     emitted_samples=emitted_samples,
                     speed=speed,
                 )
                 if audio_bytes is None:
                     continue
+                else:
+                    pass
                 if sample_rate != stream_sample_rate:
                     raise RuntimeError(
                         "Raw PCM speech stream sample rate changed from "
                         f"{stream_sample_rate} to {sample_rate}"
                     )
+                else:
+                    pass
                 yield audio_bytes
             active_request = False
         finally:
             if active_request:
-                await _abort_and_close_speech_stream(client, request_id, chunk_stream)
+                await abort_and_close_speech_stream(client, request_id, chunk_stream)
             else:
                 await _close_async_iterator_if_supported(chunk_stream)
 
@@ -1469,7 +1814,7 @@ async def _speech_audio_response(
     )
 
 
-async def _await_speech_response(
+async def await_speech_response(
     request: Request,
     client: Client,
     gen_req: GenerateRequest,
@@ -1487,7 +1832,7 @@ async def _await_speech_response(
             allow_format_fallback=False,
         )
     )
-    disconnect_task = asyncio.create_task(_wait_for_request_disconnect(request))
+    disconnect_task = asyncio.create_task(wait_for_request_disconnect(request))
     aborted = False
     try:
         done, _ = await asyncio.wait(
@@ -1496,6 +1841,8 @@ async def _await_speech_response(
         )
         if speech_task in done:
             return speech_task.result()
+        else:
+            pass
 
         await client.abort(request_id)
         aborted = True
@@ -1504,24 +1851,30 @@ async def _await_speech_response(
     except asyncio.CancelledError:
         if not aborted:
             await client.abort(request_id)
+        else:
+            pass
         raise
     finally:
         if not speech_task.done():
-            await _cancel_task_bounded(speech_task)
+            await cancel_task_bounded(speech_task)
+        else:
+            pass
         if not disconnect_task.done():
-            await _cancel_task_bounded(disconnect_task)
+            await cancel_task_bounded(disconnect_task)
+        else:
+            pass
 
 
-async def _cancel_task_bounded(task: asyncio.Task[Any]) -> None:
+async def cancel_task_bounded(task: asyncio.Task[Any]) -> None:
     task.cancel()
     done, _ = await asyncio.wait({task}, timeout=HTTP_DISCONNECT_CANCEL_TIMEOUT_S)
     if done:
         await asyncio.gather(*done, return_exceptions=True)
     else:
-        task.add_done_callback(_discard_cancelled_task_result)
+        task.add_done_callback(discard_cancelled_task_result)
 
 
-def _discard_cancelled_task_result(task: asyncio.Task[Any]) -> None:
+def discard_cancelled_task_result(task: asyncio.Task[Any]) -> None:
     try:
         task.result()
     except asyncio.CancelledError:
@@ -1530,20 +1883,12 @@ def _discard_cancelled_task_result(task: asyncio.Task[Any]) -> None:
         logger.debug("Cancelled request task finished with an error", exc_info=True)
 
 
-async def _wait_for_request_disconnect(request: Request) -> None:
+async def wait_for_request_disconnect(request: Request) -> None:
     while not await request.is_disconnected():
         await asyncio.sleep(HTTP_DISCONNECT_POLL_INTERVAL_S)
 
 
-async def _close_async_iterator_if_supported(stream: AsyncIterator[Any]) -> None:
-    try:
-        close = stream.aclose
-    except AttributeError:
-        return
-    await close()
-
-
-async def _abort_and_close_speech_stream(
+async def abort_and_close_speech_stream(
     client: Client,
     request_id: str,
     stream: AsyncIterator[Any],
@@ -1552,219 +1897,3 @@ async def _abort_and_close_speech_stream(
         await client.abort(request_id)
     finally:
         await _close_async_iterator_if_supported(stream)
-
-
-def _register_transcriptions(app: FastAPI) -> None:
-    @app.post("/v1/audio/transcriptions")
-    async def create_transcription(
-        file: UploadFile = File(...),
-        model: str | None = Form(default=None),
-        language: str | None = Form(default=None),
-        prompt: str | None = Form(default=None),
-        response_format: str = Form(default="json"),
-        temperature: float | None = Form(default=None),
-        max_new_tokens: int | None = Form(default=None, ge=1),
-        stream: bool = Form(default=False),
-    ) -> Response:
-        client: Client = app.state.client
-        default_model: str = app.state.model_name
-        request_id = f"transcription-{uuid.uuid4()}"
-
-        # TODO(Ratish): add the same pre-parser body limit used by voice uploads
-        # once transcription upload limits are defined.
-        audio_bytes = await file.read()
-        if not audio_bytes:
-            raise HTTPException(status_code=400, detail="Uploaded audio file is empty")
-
-        normalized_response_format = response_format.strip().lower()
-        if stream:
-            if normalized_response_format not in {"json", "text"}:
-                raise HTTPException(
-                    status_code=400,
-                    detail=(
-                        "stream=true supports only response_format 'json' or "
-                        f"'text', got {response_format!r}"
-                    ),
-                )
-            gen_req = build_transcription_generate_request(
-                audio_bytes=audio_bytes,
-                filename=file.filename,
-                content_type=file.content_type,
-                model=model or default_model,
-                language=language,
-                prompt=prompt,
-                temperature=temperature,
-                max_new_tokens=max_new_tokens,
-                stream=True,
-            )
-            adapter = resolve_adapter(getattr(app.state, "architectures", None))
-            duration_s = _probe_audio_duration(audio_bytes)
-            return StreamingResponse(
-                _transcription_stream(
-                    client,
-                    gen_req,
-                    request_id=request_id,
-                    adapter=adapter,
-                    duration_s=duration_s,
-                ),
-                media_type="text/event-stream",
-                headers={"Cache-Control": "no-cache", "X-Request-Id": request_id},
-            )
-
-        gen_req = build_transcription_generate_request(
-            audio_bytes=audio_bytes,
-            filename=file.filename,
-            content_type=file.content_type,
-            model=model or default_model,
-            language=language,
-            prompt=prompt,
-            temperature=temperature,
-            max_new_tokens=max_new_tokens,
-        )
-
-        try:
-            result = await client.completion(gen_req, request_id=request_id)
-        except ClientError as exc:
-            if _is_bad_request_error(exc):
-                raise HTTPException(status_code=400, detail=str(exc)) from exc
-            raise HTTPException(status_code=500, detail=str(exc)) from exc
-        except Exception as exc:
-            if _is_bad_request_error(exc):
-                raise HTTPException(status_code=400, detail=str(exc)) from exc
-            logger.exception("Error transcribing audio for request %s", request_id)
-            raise HTTPException(status_code=500, detail=str(exc)) from exc
-
-        text = result.text
-        if normalized_response_format == "text":
-            return PlainTextResponse(text)
-        if normalized_response_format not in {"json", "verbose_json"}:
-            raise HTTPException(
-                status_code=400,
-                detail=(
-                    "Unsupported response_format for /v1/audio/transcriptions: "
-                    f"{response_format!r}"
-                ),
-            )
-
-        adapter = resolve_adapter(getattr(app.state, "architectures", None))
-        text = adapter.postprocess_text(text)
-        duration_s = _probe_audio_duration(audio_bytes)
-        usage = (
-            TranscriptionUsage(seconds=math.ceil(duration_s))
-            if duration_s > 0
-            else None
-        )
-        if normalized_response_format == "verbose_json":
-            response = adapter.build_verbose_response(
-                text=text,
-                language=language,
-                audio_duration_s=duration_s,
-            )
-            response.usage = usage
-            return JSONResponse(content=response.model_dump(exclude_none=True))
-        return JSONResponse(
-            content=TranscriptionResponse(text=text, usage=usage).model_dump(
-                exclude_none=True
-            )
-        )
-
-
-async def _transcription_stream(
-    client: Client,
-    gen_req: GenerateRequest,
-    *,
-    request_id: str,
-    adapter: Any,
-    duration_s: float,
-) -> AsyncIterator[str]:
-    """SSE generator for streaming transcriptions.
-
-    Emits OpenAI-style transcript.text.delta events for each partial text
-    chunk, then a terminal transcript.text.done event carrying the full
-    post-processed transcript.
-    """
-    final_text: str | None = None
-    try:
-        async for chunk in client.generate(gen_req, request_id=request_id):
-            if chunk.finish_reason is not None:
-                if isinstance(chunk.text, str) and chunk.text:
-                    final_text = chunk.text
-                continue
-            if chunk.modality == "text" and chunk.text:
-                event = TranscriptionTextDeltaEvent(delta=chunk.text)
-                yield f"data: {event.model_dump_json(exclude_none=True)}\n\n"
-    except Exception as exc:
-        logger.exception("Error streaming transcription for request %s", request_id)
-        payload = {"type": "error", "error": {"message": str(exc)}}
-        yield f"data: {json.dumps(payload)}\n\n"
-        return
-
-    text = adapter.postprocess_text(final_text or "")
-    usage = (
-        TranscriptionUsage(seconds=math.ceil(duration_s)) if duration_s > 0 else None
-    )
-    done_event = TranscriptionTextDoneEvent(text=text, usage=usage)
-    yield f"data: {done_event.model_dump_json(exclude_none=True)}\n\n"
-    yield f"data: {STREAM_DONE_SENTINEL}\n\n"
-
-
-def _probe_audio_duration(audio_bytes: bytes) -> float:
-    """Best-effort audio duration (seconds) from raw upload bytes.
-
-    Uses ``soundfile.info`` (metadata only, no full decode; torchaudio removed
-    its ``info`` API in 2.x). Returns 0.0 if the duration cannot be
-    determined; callers treat 0.0 as "unknown".
-    """
-    try:
-        import soundfile as sf
-
-        info = sf.info(io.BytesIO(audio_bytes))
-        if info.samplerate:
-            return max(info.frames / float(info.samplerate), 0.0)
-    except (RuntimeError, ValueError):
-        logger.debug("Could not probe audio duration", exc_info=True)
-    return 0.0
-
-
-def build_transcription_generate_request(
-    *,
-    audio_bytes: bytes,
-    filename: str | None,
-    content_type: str | None,
-    model: str,
-    language: str | None,
-    prompt: str | None,
-    temperature: float | None,
-    max_new_tokens: int | None = None,
-    stream: bool = False,
-) -> GenerateRequest:
-    params: dict[str, Any] = {"task": "transcribe"}
-    metadata: dict[str, Any] = {"task": "asr"}
-    explicit_fields: list[str] = []
-    if language is not None:
-        params["language"] = language
-    if prompt is not None:
-        params["prompt"] = prompt
-    if temperature is not None:
-        explicit_fields.append("temperature")
-    if max_new_tokens is not None:
-        explicit_fields.append("max_new_tokens")
-    _record_explicit_generation_params(metadata, sorted(explicit_fields))
-    sampling = SamplingParams(
-        temperature=temperature if temperature is not None else 0.0,
-        max_new_tokens=max_new_tokens,
-    )
-
-    return GenerateRequest(
-        model=model,
-        prompt={
-            "audio_bytes": audio_bytes,
-            "filename": filename,
-            "content_type": content_type,
-        },
-        sampling=sampling,
-        extra_params=params,
-        stream=stream,
-        output_modalities=["text"],
-        metadata=metadata,
-    )

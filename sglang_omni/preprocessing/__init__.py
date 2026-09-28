@@ -29,6 +29,9 @@ _LAZY_EXPORTS = {
     "ImageMediaIO": "sglang_omni.preprocessing.image",
     "load_chat_template": "sglang_omni.preprocessing.text",
     "normalize_messages": "sglang_omni.preprocessing.text",
+    "prepare_audio": "sglang_omni.preprocessing.transcription",
+    "PreparedAudio": "sglang_omni.preprocessing.transcription",
+    "resolve_audio_source": "sglang_omni.preprocessing.transcription",
     "VideoMediaIO": "sglang_omni.preprocessing.video",
 }
 
@@ -52,6 +55,9 @@ __all__ = [
     "MultiModalResourceConnector",
     "MediaIO",
     "normalize_messages",
+    "prepare_audio",
+    "PreparedAudio",
+    "resolve_audio_source",
     "VideoMediaIO",
 ]
 
@@ -60,6 +66,8 @@ def __getattr__(name: str) -> Any:
     module_name = _LAZY_EXPORTS.get(name)
     if module_name is None:
         raise AttributeError(f"module {__name__!r} has no attribute {name!r}")
+    else:
+        pass
     value = getattr(import_module(module_name), name)
     globals()[name] = value
     return value

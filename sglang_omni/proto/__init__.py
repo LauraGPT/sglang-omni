@@ -13,6 +13,12 @@ from .admin import (
     AdminResult,
     is_update_action,
 )
+from .kv_transfer import (
+    KVBufferSpec,
+    KVPoolLayout,
+    KVTransferPrepareMessage,
+    KVTransferReadyMessage,
+)
 from .messages import (
     AbortMessage,
     AdminMessage,
@@ -29,6 +35,7 @@ from .messages import (
 )
 from .request import (
     EXPLICIT_GENERATION_PARAMS_KEY,
+    EXPLICIT_STAGE_SAMPLING_PARAMS_KEY,
     OmniRequest,
     RequestInfo,
     RequestState,
@@ -53,6 +60,10 @@ __all__ = [
     "is_update_action",
     "DataAckMessage",
     "DataReadyMessage",
+    "KVBufferSpec",
+    "KVPoolLayout",
+    "KVTransferPrepareMessage",
+    "KVTransferReadyMessage",
     "AbortMessage",
     "CompleteMessage",
     "StreamMessage",
@@ -64,6 +75,7 @@ __all__ = [
     "RequestState",
     "RequestInfo",
     "EXPLICIT_GENERATION_PARAMS_KEY",
+    "EXPLICIT_STAGE_SAMPLING_PARAMS_KEY",
     "OmniRequest",
     "StagePayload",
     "StageInfo",

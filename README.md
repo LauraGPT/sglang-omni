@@ -2,6 +2,7 @@
 <img src="https://raw.githubusercontent.com/sgl-project/sglang-omni/main/docs/_static/image/sgl-omni-logo.svg" alt="logo" width="400"></img>
 
 <p>
+<a href="https://pypi.org/project/sglang-omni/"><img src="https://img.shields.io/pypi/v/sglang-omni?style=for-the-badge&logo=pypi&logoColor=white&label=PyPI" alt="PyPI"></a>
 <a href="https://github.com/sgl-project/sglang-omni/stargazers"><img src="https://img.shields.io/github/stars/sgl-project/sglang-omni?style=for-the-badge&logo=github&label=stars" alt="GitHub stars"></a>
 <a href="https://github.com/sgl-project/sglang-omni/blob/main/LICENSE"><img src="https://img.shields.io/github/license/sgl-project/sglang-omni?style=for-the-badge" alt="license"></a>
 <a href="https://github.com/sgl-project/sglang-omni/issues"><img src="https://img.shields.io/github/issues-closed-raw/sgl-project/sglang-omni?style=for-the-badge&label=closed%20issues" alt="closed issues"></a>
@@ -17,7 +18,7 @@
 <a href="https://lmsys.org/blog/"><b>Blog</b></a> |
 <a href="https://sgl-project.github.io/sglang-omni/"><b>Documentation</b></a> |
 <a href="#quick-start"><b>Quick Start</b></a> |
-<a href="./docs/cookbook/"><b>Cookbook</b></a> |
+<a href="https://sgl-project.github.io/sglang-omni/index.html"><b>Cookbook</b></a> |
 <a href="https://github.com/sgl-project/sglang"><b>SGLang</b></a> |
 <a href="https://slack.sglang.io"><b>Join Slack</b></a>
 </p>
@@ -28,8 +29,12 @@
 
 ## News
 
-- [2026/06] 🔥 MOSS-TTS Local Transformer v1.5 runs on SGLang-Omni with native-streaming 48 kHz speech. \[[Blog](https://lmsys.org/blog/2026-06-17-moss-tts-local-v15/)\] \[[Cookbook](https://sgl-project.github.io/sglang-omni/cookbook/moss_tts_local.html)\]
-- [2026/06] 🔥 Higgs Audio v3 TTS runs on SGLang-Omni for real-time, controllable speech for voice agents. \[[Blog](https://lmsys.org/blog/2026-06-04-higgs-audio-v3-tts/)\] \[[Cookbook](https://sgl-project.github.io/sglang-omni/cookbook/higgs_tts.html)\]
+- [2026/09] 🐧 Day-0 support for [AuK](https://huggingface.co/tencent/AuK) and [AuK-Flash](https://huggingface.co/tencent/AuK-Flash): text + voice instructions → 24 kHz speech on `/v1/audio/speech`, audio + editing instructions → edited speech on `/generate`. \[[Cookbook](https://sgl-project.github.io/sglang-omni/cookbook/auk.html)\]
+- [2026/09] 🚀 SGLang-Omni **v0.1.7** is on [PyPI](https://pypi.org/project/sglang-omni/). Install with `uv pip install --prerelease=allow "sglang-omni==0.1.7"`. \[[Installation](https://sgl-project.github.io/sglang-omni/get_started/installation.html)\]
+- [2026/08] 🎵 Day-0 support for [MiniMax Music 3](https://huggingface.co/MiniMaxAI/MiniMax-Music3): lyrics + caption → 32 kHz stereo song on `/v1/audio/speech`. \[[Cookbook](https://sgl-project.github.io/sglang-omni/cookbook/minimax_music3.html)\]
+- [2026/08] 🚀 TTS architecture refactor: shared pipeline state, engine construction, reference encoding, capability metadata, and vocoder scheduling. \[[Roadmap](https://github.com/sgl-project/sglang-omni/issues/985)\] \[[Blog](https://github.com/zhaochenyang20/Awesome-ML-SYS-Tutorial/blob/main/sglang/sglang-omni/tts-refactor.md)\]
+- [2026/06] 🔥 MOSS-TTS Local Transformer v1.5 on SGLang-Omni with native-streaming 48 kHz speech. \[[Blog](https://lmsys.org/blog/2026-06-17-moss-tts-local-v15/)\] \[[Cookbook](https://sgl-project.github.io/sglang-omni/cookbook/moss_tts_local.html)\]
+- [2026/06] 🔥 Higgs Audio v3 TTS for real-time, controllable speech. \[[Blog](https://lmsys.org/blog/2026-06-04-higgs-audio-v3-tts/)\] \[[Cookbook](https://sgl-project.github.io/sglang-omni/cookbook/higgs_tts.html)\]
 
 ## About
 
@@ -42,15 +47,25 @@ SGLang-Omni is a multi-stage serving runtime for omni, speech, and TTS models. I
 
 ## What SGLang-Omni Serves
 
-- **Omni chat and speech**: Run models such as [Qwen3-Omni](https://sgl-project.github.io/sglang-omni/cookbook/qwen3_omni.html) and [Ming-Omni](https://sgl-project.github.io/sglang-omni/cookbook/ming_omni.html) with multimodal inputs, text/audio outputs, and thinker-talker generation pipelines.
-- **Speech generation**: Serve [Higgs Audio v3](https://sgl-project.github.io/sglang-omni/cookbook/higgs_tts.html), [MOSS-TTS](https://sgl-project.github.io/sglang-omni/cookbook/moss_tts.html), [MOSS-TTS Local](https://sgl-project.github.io/sglang-omni/cookbook/moss_tts_local.html), [Fish Speech S2-Pro](https://sgl-project.github.io/sglang-omni/cookbook/fishaudio_s2_pro.html), [Qwen3-TTS](https://sgl-project.github.io/sglang-omni/cookbook/qwen3_tts.html), [Voxtral TTS](https://sgl-project.github.io/sglang-omni/cookbook/voxtral_tts.html), [Ming-Omni-TTS](https://sgl-project.github.io/sglang-omni/cookbook/ming_tts.html), and related TTS systems through speech, batch speech, streaming speech, and uploaded-voice APIs.
-- **Audio transcription and diarization**: Serve [Qwen3-ASR](https://sgl-project.github.io/sglang-omni/cookbook/qwen3_asr.html) and [MOSS-Transcribe-Diarize](https://sgl-project.github.io/sglang-omni/cookbook/moss_transcribe_diarize.html) through the OpenAI-compatible `/v1/audio/transcriptions` endpoint. MOSS-TD supports speaker-labelled, timestamped transcript segments with `response_format=verbose_json`.
-- **SGLang-Omni Router**: Serve multiple Omni servers behind one OpenAI-compatible endpoint, with health checks, readiness tracking, worker lifecycle control, and model-capability discovery across the worker pool. See the [Router guide](https://sgl-project.github.io/sglang-omni/basic_usage/omni_router.html).
+- **Omni chat and speech**: [Qwen3-Omni](https://sgl-project.github.io/sglang-omni/cookbook/qwen3_omni.html), [Ming-Omni](https://sgl-project.github.io/sglang-omni/cookbook/ming_omni.html) — multimodal in, text/audio out.
+- **Music generation**: [MiniMax Music 3](https://sgl-project.github.io/sglang-omni/cookbook/minimax_music3.html) — lyrics + caption → 32 kHz stereo song.
+- **Speech generation**: [Higgs Audio v3](https://sgl-project.github.io/sglang-omni/cookbook/higgs_tts.html), [MOSS-TTS](https://sgl-project.github.io/sglang-omni/cookbook/moss_tts.html), [MOSS-TTS Local](https://sgl-project.github.io/sglang-omni/cookbook/moss_tts_local.html), [Fish Speech S2-Pro](https://sgl-project.github.io/sglang-omni/cookbook/fishaudio_s2_pro.html), [Qwen3-TTS](https://sgl-project.github.io/sglang-omni/cookbook/qwen3_tts.html), [Voxtral TTS](https://sgl-project.github.io/sglang-omni/cookbook/voxtral_tts.html), [Ming-Omni-TTS](https://sgl-project.github.io/sglang-omni/cookbook/ming_tts.html), [dots.tts](https://sgl-project.github.io/sglang-omni/cookbook/dots_tts.html), [ZONOS2](https://sgl-project.github.io/sglang-omni/cookbook/zonos2.html) — `/v1/audio/speech`, batch, streaming, uploaded voices.
+- **Audio transcription and diarization**: [Qwen3-ASR](https://sgl-project.github.io/sglang-omni/cookbook/qwen3_asr.html), [Fun-ASR](https://sgl-project.github.io/sglang-omni/cookbook/fun_asr.html), [ARK-ASR](https://sgl-project.github.io/sglang-omni/cookbook/arkasr.html), [MOSS-Transcribe-Diarize](https://sgl-project.github.io/sglang-omni/cookbook/moss_transcribe_diarize.html) via `/v1/audio/transcriptions`. MOSS-TD supports speaker labels and timestamps (`response_format=verbose_json`).
+- **SGLang-Omni Router**: Multi-worker OpenAI-compatible front door — health, readiness, lifecycle, capability discovery. [Router guide](https://sgl-project.github.io/sglang-omni/basic_usage/omni_router.html).
 
-Additional model guides, including experimental and research-oriented paths, are available in the [Cookbook](https://sgl-project.github.io/sglang-omni/cookbook/).
+## Hardware Support
+
+| Backend | Status | Notes |
+|---------|--------|-------|
+| **NVIDIA CUDA** | Supported | Default backend with full model coverage. |
+| **Apple Silicon** | Experimental | Qwen3-ASR runs through native MLX or Torch MPS on macOS arm64. Install with [`install.sh`](./install.sh) and follow the [Qwen3-ASR guide](./docs/cookbook/qwen3_asr.md#apple-silicon-mlx). |
+| **Intel GPU (XPU)** | Experimental | Intel Arc GPUs via PyTorch XPU. **Qwen3-ASR, Qwen3-TTS, and Qwen3-Omni serve end-to-end** (Omni thinker via multi-XPU tensor parallelism). Install per [Intel XPU guide](./docs/get_started/installation_xpu.md); the backend is auto-detected. |
+
+Additional model guides, including experimental and research-oriented paths, are available in the [Cookbook](https://sgl-project.github.io/sglang-omni/).
 
 ## Quick Start
 
+- **macOS Apple Silicon:** from a checkout, run [`./install.sh`](./install.sh) for a one-command Homebrew + uv setup. See [installation](./docs/get_started/installation.md#macos-apple-silicon).
 - [Installation](https://sgl-project.github.io/sglang-omni/get_started/installation.html)
 - [TTS usage](https://sgl-project.github.io/sglang-omni/basic_usage/tts.html)
 - [Qwen3-Omni usage](https://sgl-project.github.io/sglang-omni/basic_usage/qwen3_omni.html)
